@@ -1,4 +1,5 @@
 build/
+build-shared/
 *.o
 *.a
 *.dylib
