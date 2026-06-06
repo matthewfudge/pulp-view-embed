@@ -209,6 +209,23 @@ int main(int argc, const char* argv[]) {
             auto fpng = render_to(fv, 1000, 600, "/tmp/pulp-embed-figma.png");
             check(!fpng.empty(), "deterministic render_png(figma) non-empty");
             check(looks_nonblank(fpng, 1000, 600), "figma VST Style render is non-blank");
+
+            // LIVE GPU back-buffer capture of the SAME figma view tree. This
+            // exercises render_frame -> paint_scene -> read_current_rgba, the
+            // path that was blank before the flush-before-readback fix.
+            if (pulp_embed_active_backend(fv) == PULP_EMBED_BACKEND_GPU) {
+                size_t lneed = 0;
+                if (pulp_embed_capture_png(fv, nullptr, 0, &lneed) == PULP_EMBED_OK && lneed) {
+                    std::vector<uint8_t> lpng(lneed);
+                    if (pulp_embed_capture_png(fv, lpng.data(), lpng.size(), &lneed) == PULP_EMBED_OK) {
+                        FILE* lf = std::fopen("/tmp/live-fixed.png", "wb");
+                        if (lf) { std::fwrite(lpng.data(), 1, lpng.size(), lf); std::fclose(lf);
+                                  std::printf("    wrote /tmp/live-fixed.png (%zu bytes)\n", lneed); }
+                        check(looks_nonblank(lpng, 1000, 600),
+                              "LIVE GPU capture(figma) is non-blank");
+                    }
+                }
+            }
             [fwin close];
             pulp_embed_destroy(fv);
         }
