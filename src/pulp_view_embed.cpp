@@ -22,6 +22,7 @@
 #include <pulp/view/view.hpp>
 
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -98,9 +99,32 @@ PulpEmbedResult check_desc(const PulpEmbedDesc* desc) {
     return PULP_EMBED_OK;
 }
 
-// Shared create path over an already-loaded JSON string.
+// Rewrite relative asset/font local_paths to absolute against base_dir so the
+// materializer can load rasterized images (e.g. the figma export's assets/*.png)
+// regardless of the process CWD. DesignIR JSON stores local_path relative to the
+// IR file; without this, ImageViews fail to load and the design renders without
+// its bitmap content. No-op when base_dir is empty or the path is already absolute.
+void resolve_asset_paths(pulp::view::DesignIR& ir, const std::string& base_dir) {
+    if (base_dir.empty()) return;
+    namespace fs = std::filesystem;
+    const fs::path base(base_dir);
+    for (auto& asset : ir.asset_manifest.assets) {
+        if (asset.local_path && !asset.local_path->empty()) {
+            fs::path p(*asset.local_path);
+            if (p.is_relative()) asset.local_path = (base / p).lexically_normal().string();
+        }
+    }
+    // Bundled fonts reference their file through the asset manifest (asset_id ->
+    // IRAssetRef.local_path, resolved above); resolved_path, when set, is already
+    // absolute. So no separate font-path rewrite is needed here.
+}
+
+// Shared create path over an already-loaded JSON string. asset_base_dir is the
+// directory relative asset paths resolve against (the IR file's dir, or
+// desc->asset_base_path for the in-memory variant).
 PulpEmbedResult create_from_json(const PulpEmbedDesc* desc,
                                  const std::string& json,
+                                 const std::string& asset_base_dir,
                                  PulpEmbedView** out_view) {
     if (out_view) *out_view = nullptr;
     g_create_error.clear();
@@ -117,6 +141,7 @@ PulpEmbedResult create_from_json(const PulpEmbedDesc* desc,
         g_create_error = std::string("DesignIR parse failed: ") + e.what();
         return PULP_EMBED_ERR_PARSE;
     }
+    resolve_asset_paths(ir, asset_base_dir);
 
     auto v = std::make_unique<PulpEmbedView>();
 
@@ -181,7 +206,9 @@ PulpEmbedResult pulp_embed_create_from_design_json(const PulpEmbedDesc* desc,
         if (!f) { g_create_error = std::string("cannot open ") + path; return PULP_EMBED_ERR_PARSE; }
         std::ostringstream ss;
         ss << f.rdbuf();
-        return create_from_json(desc, ss.str(), out_view);
+        // Relative asset paths in the IR resolve against the IR file's directory.
+        const std::string base_dir = std::filesystem::path(path).parent_path().string();
+        return create_from_json(desc, ss.str(), base_dir, out_view);
     } catch (const std::exception& e) {
         g_create_error = std::string("internal: ") + e.what();
         return PULP_EMBED_ERR_INTERNAL;
@@ -198,7 +225,9 @@ PulpEmbedResult pulp_embed_create_from_design_json_str(const PulpEmbedDesc* desc
     try {
         if (out_view) *out_view = nullptr;
         if (!json) { g_create_error = "null json"; return PULP_EMBED_ERR_INVALID_ARG; }
-        return create_from_json(desc, std::string(json, json_len), out_view);
+        const std::string base_dir =
+            (desc && desc->asset_base_path) ? std::string(desc->asset_base_path) : std::string();
+        return create_from_json(desc, std::string(json, json_len), base_dir, out_view);
     } catch (const std::exception& e) {
         g_create_error = std::string("internal: ") + e.what();
         return PULP_EMBED_ERR_INTERNAL;
