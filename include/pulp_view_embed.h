@@ -124,13 +124,37 @@ PulpEmbedResult pulp_embed_create_from_design_json_str(const PulpEmbedDesc* desc
 size_t pulp_embed_last_create_error(char* buf, size_t cap);
 
 /* ---- lifecycle -------------------------------------------------------- */
+/*
+ * Two legal attach modes — pick ONE per view, never mix them:
+ *
+ *   (A) Pulp-parents:  pulp_embed_attach(view, parent)
+ *       Pulp adds its child into your parent NSView and fires the lifecycle.
+ *       Best for bespoke hosts that have a parent native view to hand over.
+ *
+ *   (B) Host-parents:  pulp_embed_native_handle(view) -> notify_attached(view)
+ *       You take Pulp's child native view and insert it into your own
+ *       hierarchy (e.g. juce::NSViewComponent::setView, iPlug2 IGraphics),
+ *       then call notify_attached() so Pulp fires the view-opened lifecycle.
+ *       Required for frameworks whose native component owns parenting.
+ */
 
-/* Attach the child view to parent_native_handle (NSView* on macOS) and, on a
- * confirmed attach, fire the view-opened lifecycle. If the attach does not take
- * (null/invalid parent), returns PULP_EMBED_ERR_ATTACH and does NOT fire
- * view-opened, keeping open/close balanced. Re-attaching an already-attached
- * view is a no-op returning PULP_EMBED_OK. The host must NOT also parent the
- * child itself; this call owns parenting + lifecycle. */
+/* The Pulp child view's native handle (NSView* on macOS). For mode (B): insert
+ * it into your framework's native hierarchy, then call notify_attached().
+ * Returns NULL before creation succeeds. The handle is owned by Pulp — do NOT
+ * release it; null your wrapper's reference before pulp_embed_destroy(). */
+void* pulp_embed_native_handle(PulpEmbedView* view);
+
+/* Mode (B): tell Pulp the host has parented the child view. Fires the
+ * view-opened lifecycle iff the child is actually in a native hierarchy
+ * (superview != nil on macOS); otherwise returns PULP_EMBED_ERR_ATTACH and
+ * does NOT fire it (keeping open/close balanced). Idempotent. */
+PulpEmbedResult pulp_embed_notify_attached(PulpEmbedView* view);
+
+/* Mode (A): attach the child view to parent_native_handle (NSView* on macOS)
+ * and, on a confirmed attach, fire the view-opened lifecycle. If the attach
+ * does not take (null/invalid parent), returns PULP_EMBED_ERR_ATTACH and does
+ * NOT fire view-opened. Re-attaching an already-attached view is a no-op
+ * returning PULP_EMBED_OK. */
 PulpEmbedResult pulp_embed_attach(PulpEmbedView* view, void* parent_native_handle);
 
 /* Detach the child view from its parent. Balances pulp_embed_attach and fires

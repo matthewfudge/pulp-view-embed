@@ -218,6 +218,25 @@ size_t pulp_embed_last_create_error(char* buf, size_t cap) {
     return s.size();
 }
 
+void* pulp_embed_native_handle(PulpEmbedView* v) {
+    if (!v || !v->host) return nullptr;
+    try { return v->host->native_handle(); } catch (...) { return nullptr; }
+}
+
+PulpEmbedResult pulp_embed_notify_attached(PulpEmbedView* v) {
+    if (!v || !v->host || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        if (!v->host->is_attached())
+            return set_err(v, PULP_EMBED_ERR_ATTACH, "child not parented; cannot notify_attached");
+        if (!v->opened) { v->bridge->notify_attached(); v->opened = true; }
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "notify_attached threw");
+    }
+}
+
 PulpEmbedResult pulp_embed_attach(PulpEmbedView* v, void* parent) {
     if (!v || !v->host || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
     try {
