@@ -37,6 +37,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -235,6 +236,24 @@ public:
     pulp::view::ScriptedUiSession* active_scripted_ui() override { return session_.get(); }
     const pulp::view::ScriptedUiSession* active_scripted_ui() const override { return session_.get(); }
 
+    // Reload the scripted UI in place (pulp_embed_reload_bundle). With an empty
+    // new_bundle_dir, reload the current bundle (picks up edits to its ui.js);
+    // otherwise switch to new_bundle_dir/ui.js. Regenerates the effective script
+    // the same way load_or_throw did (dev = the original ui.js; otherwise the
+    // asset-resolver-wrapped temp) and hands it to ScriptedUiSession::reload_from,
+    // which rebuilds under the same root + GPU surface, preserves widget state,
+    // and probes first (a bad reload keeps the last-good UI -> returns false).
+    bool reload(const std::filesystem::path& new_bundle_dir, std::string* error) {
+        if (!session_) { if (error) *error = "no scripted session to reload"; return false; }
+        if (!new_bundle_dir.empty()) {
+            bundle_dir_ = new_bundle_dir;
+            script_path_ = bundle_dir_ / "ui.js";
+        }
+        const bool dev = std::getenv("PULP_EMBED_HOT_RELOAD") != nullptr;
+        effective_script_ = dev ? script_path_ : build_effective_script();
+        return session_->reload_from(effective_script_, error);
+    }
+
     // Destroy the scripted session (and its WidgetBridge) while the root View
     // it references is still alive. MUST be called before the ViewBridge closes
     // (which destroys the root) — the WidgetBridge destructor touches root_,
@@ -380,6 +399,11 @@ struct PulpEmbedView {
     // Guard: true while applying a HOST-driven change so the store listener does
     // not bounce the value back out to host.set_param (feedback-loop break).
     bool applying_host_change = false;
+
+    // Thread that created the view. pulp_embed_reload_bundle (which rebuilds views
+    // + touches the GPU surface) must run here; a call from another thread is
+    // rejected with PULP_EMBED_ERR_WRONG_THREAD. Captured at construction.
+    std::thread::id creator_thread = std::this_thread::get_id();
 };
 
 namespace {
@@ -775,6 +799,22 @@ void build_param_bridge(PulpEmbedView* v) {
     auto* root = v->bridge->view();
     if (!root) return;
 
+    // Reload-safe: a rebuild (pulp_embed_reload_bundle) must reuse the StateStore
+    // params that already exist for a key — the store has no remove API, and the
+    // host binds by key. Snapshot key->param_id, drop the old widget bindings +
+    // listener, then re-collect; existing keys reuse their store param, new keys
+    // allocate a fresh id past the current max. (First call: prev is empty, so
+    // ids are 1..N exactly as before.)
+    std::unordered_map<std::string, pulp::state::ParamID> prev;
+    pulp::state::ParamID max_id = 0;
+    for (const auto& b : v->params) {
+        prev[b.key] = b.param_id;
+        if (b.param_id > max_id) max_id = b.param_id;
+    }
+    v->param_listener.reset();
+    v->params.clear();
+    v->key_to_index.clear();
+
     collect_bindable(root, v->params);
 
     // Faithful-vector lane (v2): DesignFrameView's elements (SVG-patch knobs +
@@ -801,14 +841,20 @@ void build_param_bridge(PulpEmbedView* v) {
 
     for (size_t i = 0; i < v->params.size(); ++i) {
         auto& b = v->params[i];
-        b.param_id = static_cast<pulp::state::ParamID>(i + 1);  // 0 reserved
+        // Reuse the store param for a key that already existed (reload); else
+        // allocate a fresh id past the current max and register it once.
+        auto reused = prev.find(b.key);
+        const bool is_new = (reused == prev.end());
+        b.param_id = is_new ? ++max_id : reused->second;
         v->key_to_index[b.key] = i;
 
-        pulp::state::ParamInfo info;
-        info.id = b.param_id;
-        info.name = b.key;
-        info.range = pulp::state::ParamRange{0.0f, 1.0f, 0.0f, 0.0f};
-        v->store->add_parameter(info);
+        if (is_new) {
+            pulp::state::ParamInfo info;
+            info.id = b.param_id;
+            info.name = b.key;
+            info.range = pulp::state::ParamRange{0.0f, 1.0f, 0.0f, 0.0f};
+            v->store->add_parameter(info);
+        }
 
         // Seed: prefer the host's current value (automation/preset already set
         // before the editor opened), else the widget's imported default.
@@ -1234,6 +1280,38 @@ PulpEmbedResult pulp_embed_repaint(PulpEmbedView* v) {
         return PULP_EMBED_OK;
     } catch (...) {
         return set_err(v, PULP_EMBED_ERR_INTERNAL, "repaint threw");
+    }
+}
+
+PulpEmbedResult pulp_embed_reload_bundle(PulpEmbedView* v, const char* bundle_dir) {
+    if (!v) return PULP_EMBED_ERR_INVALID_ARG;
+    // Rebuilds views + touches the GPU surface — must run on the creator thread.
+    if (std::this_thread::get_id() != v->creator_thread)
+        return set_err(v, PULP_EMBED_ERR_WRONG_THREAD,
+                       "reload must be called on the thread that created the view");
+    auto* sp = dynamic_cast<EmbedScriptedProcessor*>(v->processor.get());
+    if (!sp)
+        return set_err(v, PULP_EMBED_ERR_UNSUPPORTED,
+                       "reload is supported only for the scripted bundle path "
+                       "(create_from_ui_bundle)");
+    try {
+        std::string err;
+        const std::filesystem::path dir =
+            bundle_dir ? std::filesystem::path(bundle_dir) : std::filesystem::path();
+        // probe-first / last-good lives in ScriptedUiSession::reload_from: on
+        // failure the running UI is untouched and we report the error.
+        if (!sp->reload(dir, &err))
+            return set_err(v, PULP_EMBED_ERR_INTERNAL,
+                           err.empty() ? "reload failed (last-good UI kept)" : err);
+        // The widget tree was rebuilt — rebuild the param bridge (reuses store
+        // params by key; resets the old bindings/listener internally).
+        build_param_bridge(v);
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "reload threw");
     }
 }
 

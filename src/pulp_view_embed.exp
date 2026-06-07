@@ -31,6 +31,7 @@ _pulp_embed_param_count
 _pulp_embed_param_key
 _pulp_embed_param_value
 _pulp_embed_param_widget_id
+_pulp_embed_reload_bundle
 _pulp_embed_render_frame_rgba
 _pulp_embed_render_png
 _pulp_embed_repaint

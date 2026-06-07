@@ -138,9 +138,17 @@ Notes:
   asset in `assets/`. Pulp's `lock_to_source` / `jsx_lock` keep anchored
   hand-edits reconcilable across a later real re-import; `live_constant_editor`
   is the basis for a constrained numeric dev-tweak UI.
-- Roadmap: an explicit `pulp_embed_reload_bundle()` ABI call (for an in-host
-  editor that rewrites the bundle programmatically) and adapter-side
-  debounced file-watch helpers — see the roadmap section.
+- **Programmatic reload (ABI v4):** `pulp_embed_reload_bundle(view, bundle_dir)`
+  reloads in place — `bundle_dir = NULL` reloads the current bundle (pick up
+  edits), or pass a new dir to swap bundles. Same `PulpEmbedView*`, attach, and
+  host callbacks; the param list is rebuilt by key (re-enumerate
+  `pulp_embed_param_*` after). Probe-first **last-good** (a broken edit keeps the
+  running UI). UI-thread-only (`PULP_EMBED_ERR_WRONG_THREAD` otherwise); scripted
+  bundle path only. This is the on-demand counterpart to the file-watched
+  `PULP_EMBED_HOT_RELOAD` dev flag — drive it from an in-host editor or a
+  debounced adapter file-watcher.
+- Roadmap: adapter-side debounced file-watch helpers (JUCE Timer / iPlug2 timer
+  polling mtimes → `pulp_embed_reload_bundle`).
 
 ## What you actually get (plain-English FAQ)
 

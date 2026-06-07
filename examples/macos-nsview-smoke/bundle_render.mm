@@ -71,6 +71,18 @@ int main(int argc, const char* argv[]) {
         pulp_embed_attach(v, (__bridge void*)win.contentView);
         pump(20);
 
+        // Reload self-check (ABI v4): PULP_EMBED_TEST_RELOAD=1 reloads the current
+        // bundle in place and confirms it round-trips with a stable param count.
+        if (std::getenv("PULP_EMBED_TEST_RELOAD")) {
+            const int before = pulp_embed_param_count(v);
+            PulpEmbedResult rr = pulp_embed_reload_bundle(v, nullptr);
+            pump(10);
+            const int after = pulp_embed_param_count(v);
+            char e[512]; e[0] = 0; pulp_embed_last_error(v, e, sizeof e);
+            std::printf("RELOAD result=%d paramCount %d->%d err=%s\n",
+                        rr, before, after, e);
+        }
+
         // Deterministic Skia render — directly comparable to importer --validate.
         size_t need = 0;
         if (pulp_embed_render_png(v, w, h, scale, nullptr, 0, &need) != PULP_EMBED_OK || !need) {

@@ -56,7 +56,7 @@ extern "C" {
  *       frame). These are new functions, not desc-layout changes.
  * The desc layout grows (host block gains resolve_resource), so this is a real
  * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
-#define PULP_VIEW_EMBED_ABI_VERSION 3u
+#define PULP_VIEW_EMBED_ABI_VERSION 4u
 
 /* Opaque embedded-view handle. */
 typedef struct PulpEmbedView PulpEmbedView;
@@ -71,7 +71,8 @@ typedef enum PulpEmbedResult {
     PULP_EMBED_ERR_ATTACH           = 6,  /* attach to parent did not take           */
     PULP_EMBED_ERR_UNSUPPORTED      = 7,  /* capability absent (e.g. CPU capture)    */
     PULP_EMBED_ERR_BUFFER_TOO_SMALL = 8,  /* out buffer < required (see *out_len)    */
-    PULP_EMBED_ERR_INTERNAL         = 9   /* unexpected; a C++ exception was caught  */
+    PULP_EMBED_ERR_INTERNAL         = 9,  /* unexpected; a C++ exception was caught  */
+    PULP_EMBED_ERR_WRONG_THREAD     = 10  /* called off the view's creator thread    */
 } PulpEmbedResult;
 
 /* Desired backend (PulpEmbedDesc.backend_pref). */
@@ -331,6 +332,27 @@ PulpEmbedResult pulp_embed_tick(PulpEmbedView* view);
 
 /* Request a repaint (e.g. after the host changed a value the view reflects). */
 PulpEmbedResult pulp_embed_repaint(PulpEmbedView* view);
+
+/* Reload the embedded design in place (ABI v4). For the high-fidelity bundle
+ * path, rebuilds the scripted UI from `bundle_dir`'s ui.js — or the CURRENT
+ * bundle when `bundle_dir` is NULL — reusing the same native child view + GPU
+ * surface and preserving widget values. The host keeps the same PulpEmbedView*,
+ * the same attach/parent, the same host callbacks; the parameter list is rebuilt
+ * by key (after a successful reload the host may re-enumerate pulp_embed_param_*).
+ *
+ * Last-good: the new code is validated before it replaces the live UI, so a
+ * broken edit leaves the running design intact and this returns an error
+ * (pulp_embed_last_error carries detail).
+ *
+ * Use it to drive an in-host "edit bundle -> reload" loop programmatically (the
+ * complement to the PULP_EMBED_HOT_RELOAD file-watch dev flag). For dev editing
+ * point the bundle at the importer's default absolute asset paths.
+ *
+ * Threading: must be called on the SAME thread that created the view (it rebuilds
+ * views + touches the GPU surface); otherwise returns PULP_EMBED_ERR_WRONG_THREAD
+ * and does nothing. Returns PULP_EMBED_ERR_UNSUPPORTED for a DesignIR/offscreen
+ * view (only the scripted bundle path is reloadable). */
+PulpEmbedResult pulp_embed_reload_bundle(PulpEmbedView* view, const char* bundle_dir);
 
 /* Fill *out with the design's resize constraints (preferred/min/max/aspect). */
 PulpEmbedResult pulp_embed_size_hints(PulpEmbedView* view, PulpEmbedSizeHints* out);
