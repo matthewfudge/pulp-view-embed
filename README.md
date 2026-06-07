@@ -5,9 +5,10 @@ frontend (e.g. a design imported from Figma) as a rendered child view inside a
 **foreign C++ host** — JUCE, iPlug2, or a bespoke shell — without the host
 linking Pulp's C++ ABI.
 
-> Status: **experiment**. macOS is working end to end: high-fidelity render
-> **plus** an interactive host↔view parameter bridge (a dragged control moves a
-> host parameter; host automation moves the control). Not for production yet.
+> Status: **experiment**. macOS is working end to end: high-fidelity render,
+> an interactive host↔view parameter bridge (a dragged control moves a host
+> parameter; host automation moves the control), a host resource-resolution
+> callback, and an offscreen/texture render mode. Not for production yet.
 > See `planning/2026-06-06-foreign-host-embedding-revised-plan.md` in the Pulp
 > repo for the roadmap.
 
@@ -67,9 +68,76 @@ pulp_embed_create_from_ui_bundle(&desc, "bundle", &view);   # renders that bundl
   - `pulp_embed_simulate_param_drag(view, index, target)` drives a control
     through its real interaction path for headless host testing.
 
-The smoke (`examples/macos-nsview-smoke`) drives the M1.1–M1.8 gates: synthetic +
-Figma "VST Style" DesignIR, GPU attach/capture, CPU backend, 100× teardown, the
-high-fidelity bundle render, and the bidirectional parameter bridge.
+### Host resource resolution (ABI v3)
+
+A host can serve a design's assets from memory (an in-memory store, an
+encrypted bundle, a project file) instead of from disk by supplying
+`PulpEmbedDesc.host.resolve_resource`:
+
+```c
+const uint8_t* resolve_resource(void* host_ctx, const char* id, size_t* out_len);
+```
+
+The shim offers every asset the design references to this callback **before**
+falling back to disk. Return borrowed bytes (valid until creation returns) +
+write the byte count, or `NULL` to fall back to loading `id` from disk. The
+asset `id` is the path as written in the design:
+
+- bundle path (`pulp_embed_create_from_ui_bundle`): the path in `ui.js`, e.g.
+  `assets/<hash>.png`.
+- DesignIR path (`pulp_embed_create_from_design_json[_str]`): the manifest
+  asset's `local_path`.
+
+Bytes the host serves are staged to a temp file (removed on `destroy`) so the
+existing on-disk render path picks them up — the host may free its buffer as
+soon as the callback returns. (Image draws decode straight through Skia by
+path, so staging is how the host's bytes reach every consumer uniformly.)
+
+### Offscreen / texture render mode (ABI v3)
+
+For a host that composites Pulp's output itself — no Pulp-owned child NSView —
+create an offscreen view and pull finished frames on demand:
+
+```c
+PulpEmbedResult pulp_embed_create_offscreen(const PulpEmbedDesc* desc,
+                                            const char* source,    // IR path or bundle dir
+                                            int32_t from_bundle,   // 0 = DesignIR, 1 = bundle
+                                            PulpEmbedView** out_view);
+
+PulpEmbedResult pulp_embed_render_frame_rgba(PulpEmbedView* view,
+                                             int32_t width, int32_t height, float scale,
+                                             uint8_t* out, size_t cap,
+                                             int32_t* w, int32_t* h, int32_t* stride);
+```
+
+The offscreen view is built through the same materializer / scripted-UI
+pipeline, parameter bridge, and `resolve_resource` staging as the windowed
+paths — it just has no parent window and no display-link. `render_frame_rgba`
+hands back a CPU-readable **RGBA8** frame (R,G,B,A byte order, premultiplied
+alpha, sRGB, top-to-bottom, `stride == w * 4`), pixel dimensions
+`width*scale × height*scale`, via Pulp's deterministic headless Skia renderer —
+so offscreen output matches the windowed embed's high-fidelity render exactly
+(the M1.10 gate asserts a 0.00000 pixel diff vs the windowed render). Two-call
+sizing pattern: pass `out=NULL` to learn `*w/*h/*stride`, then call again with
+`cap >= *stride * *h`. `render_frame_rgba` also works on a windowed view (it
+renders deterministically rather than reading a live back buffer — use
+`pulp_embed_capture_png` for the live host surface). A zero-copy GPU
+texture/IOSurface handle is deferred (see "Scoped out").
+
+The smoke (`examples/macos-nsview-smoke`) drives the M1.1–M1.10 gates: synthetic
++ Figma "VST Style" DesignIR, GPU attach/capture, CPU backend, 100× teardown,
+the high-fidelity bundle render, the bidirectional parameter bridge, the
+resolve_resource host callback (same-bytes parity + different-bytes control),
+and the offscreen render mode (matches the windowed render).
+
+### Scoped out (this round)
+
+- **Zero-copy GPU compositing** (`IOSurface` / `MTLTexture` handle): deferred.
+  Codex's call — ship CPU RGBA readback first; a GPU handle needs a defined
+  ownership/synchronization/resize-invalidation contract and a way to advance
+  the offscreen scripted/GPU path without a display link.
+- Non-macOS offscreen RGBA: `render_to_rgba` is macOS-only for now (the
+  non-Apple screenshot stub has no portable raw-pixel producer).
 
 ## Build
 
