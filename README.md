@@ -12,6 +12,52 @@ linking Pulp's C++ ABI.
 > See `planning/2026-06-06-foreign-host-embedding-revised-plan.md` in the Pulp
 > repo for the roadmap.
 
+## Status / what works / known limitations / roadmap
+
+**What works (macOS, end to end):**
+
+- Two create paths — high-fidelity importer JS bundle (rasterized images,
+  skeuomorphic knobs, glass) and lightweight DesignIR — both opening a
+  `ViewBridge` + `PluginViewHost` (GPU Dawn/Skia, CPU fallback).
+- Lifecycle: pulp-parents (`attach`) and host-parents (`native_handle` +
+  `notify_attached`); `resize` (with validated DPI scale), `tick`, `repaint`,
+  `size_hints`, `active_backend`.
+- **Interactive parameters (ABI v3):** controls bind bidirectionally to the
+  host's parameters by **string key** (UI drag → host gesture/set; host
+  automation → control, no feedback loop).
+- **Plugin formats:** consumed by real VST3 / AU / CLAP plugins via the JUCE and
+  iPlug2 adapter repos (the editor IS the embedded design).
+- **Offscreen / texture render mode**, **`resolve_resource`** host-asset
+  callback, **font** resolution + portable bundling, and a relocatable
+  shared-library + tarball **packaging** story (`DISTRIBUTING.md`).
+- Deterministic headless Skia render (`render_png` / `render_frame_rgba`) +
+  live GPU back-buffer capture (`capture_png`).
+- Smoke gates M1.1–M1.11 (create/attach/teardown stress, hi-fi bundle, param
+  bridge, resolve_resource, offscreen, and a resize/scale/DPI stress sweep).
+
+**Known limitations:**
+
+- macOS only today (the GPU host and the offscreen RGBA producer are
+  macOS-specific; Windows/Linux need a `PluginViewHost` factory + raw-pixel
+  producer).
+- Requires an installed Pulp SDK on `CMAKE_PREFIX_PATH` (the static build cannot
+  stand alone; the shared-lib dist is the foreign-host path).
+- `pulp_embed_resize`'s `scale` is validated but advisory for the windowed embed
+  (the host NSWindow drives backing DPI); only the capture APIs honor it.
+- Zero-copy GPU compositing (IOSurface/MTLTexture handle) is deferred — the
+  offscreen path returns CPU RGBA today.
+
+**Resolved design questions** (from the foreign-host-embedding plan):
+
+- *Event-loop tick* — borrowed from the host: the host's display-link (GPU) plus
+  a host timer drive `pulp_embed_tick`; the shim runs no loop of its own.
+- *Parameter model* — string-key based, which works for both JUCE
+  `AudioProcessorParameter` and iPlug2 `IParam` (the host maps its own
+  parameters onto the design's keys once at create time).
+
+**Roadmap:** Windows/Linux `PluginViewHost`; zero-copy GPU compositing;
+`pulp add` foreign-host packaging integration.
+
 ## Why
 
 The host owns the native parent window; Pulp owns a child view and renders into

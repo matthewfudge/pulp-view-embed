@@ -1,0 +1,134 @@
+name: CI
+
+# Builds pulp-view-embed against an installed Pulp SDK and runs the macOS
+# embed smoke (ctest -R embed-smoke), including the M1.11 resize/scale/DPI
+# stress gate.
+#
+# GPU reality: GitHub-hosted macOS runners have no Metal adapter / window
+# server, so the GPU-backed attach + live back-buffer capture asserts cannot
+# pass there. The smoke degrades NATURALLY (every GPU assert is gated on
+# active_backend == GPU) and we additionally set PULP_EMBED_CI_NO_GPU=1 to
+# force the CPU backend for a deterministic hosted run — the create / attach /
+# teardown / param-bridge / offscreen / resolve_resource / headless-Skia-render
+# gates all still run (81/85 asserts). The full-fidelity GPU lane runs in a
+# Pulp Tart VM (Apple Virtualization exposes Metal headless) — see
+# "Running the GPU lane in a Tart VM" in this file's trailing comment.
+#
+# SDK acquisition (the repo CANNOT build standalone — it does
+# find_package(Pulp CONFIG REQUIRED)):
+#   1. Restore an actions/cache keyed on the SDK version (vars.PULP_SDK_VERSION).
+#   2. On a miss, download vars.PULP_SDK_TARBALL_URL and verify its sha256
+#      against vars.PULP_SDK_TARBALL_SHA256 (a stale/wrong SDK is worse than a
+#      missing one — it yields believable-but-invalid CI).
+#   3. If neither a cache hit nor a URL exists, FAIL with a clear message telling
+#      the maintainer to publish/cache an SDK tarball (tools/package-sdk.sh).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-15
+    env:
+      # Force-headless on hosted runners (no Metal). Remove in the Tart lane.
+      PULP_EMBED_CI_NO_GPU: "1"
+      PULP_SDK_VERSION: ${{ vars.PULP_SDK_VERSION }}
+      PULP_SDK_TARBALL_URL: ${{ vars.PULP_SDK_TARBALL_URL }}
+      PULP_SDK_TARBALL_SHA256: ${{ vars.PULP_SDK_TARBALL_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve SDK prefix
+        id: sdk
+        run: |
+          echo "prefix=${RUNNER_TEMP}/pulp-sdk" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Pulp SDK cache
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.sdk.outputs.prefix }}
+          key: pulp-sdk-${{ runner.os }}-${{ runner.arch }}-${{ env.PULP_SDK_VERSION || 'unset' }}
+
+      - name: Acquire Pulp SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          PREFIX="${{ steps.sdk.outputs.prefix }}"
+          if [ -z "${PULP_SDK_TARBALL_URL:-}" ]; then
+            echo "::error::No cached Pulp SDK and no PULP_SDK_TARBALL_URL set."
+            echo "::error::Publish a relocatable SDK tarball with tools/package-sdk.sh"
+            echo "::error::then set repo variables PULP_SDK_VERSION, PULP_SDK_TARBALL_URL,"
+            echo "::error::and PULP_SDK_TARBALL_SHA256 (Settings -> Secrets and variables -> Actions -> Variables)."
+            exit 1
+          fi
+          echo "Downloading SDK from ${PULP_SDK_TARBALL_URL}"
+          curl -fSL "${PULP_SDK_TARBALL_URL}" -o "${RUNNER_TEMP}/pulp-sdk.tar.gz"
+          if [ -n "${PULP_SDK_TARBALL_SHA256:-}" ]; then
+            echo "${PULP_SDK_TARBALL_SHA256}  ${RUNNER_TEMP}/pulp-sdk.tar.gz" | shasum -a 256 -c -
+          else
+            echo "::warning::PULP_SDK_TARBALL_SHA256 not set — skipping checksum verification (a stale SDK can produce invalid CI)."
+          fi
+          mkdir -p "${PREFIX}"
+          # The tarball unpacks to a single top-level pulp-sdk-<version>/ dir;
+          # flatten it into PREFIX so CMAKE_PREFIX_PATH points straight at the SDK.
+          tar xzf "${RUNNER_TEMP}/pulp-sdk.tar.gz" -C "${RUNNER_TEMP}"
+          inner="$(find "${RUNNER_TEMP}" -maxdepth 1 -type d -name 'pulp-sdk-*' | head -1)"
+          if [ -n "${inner}" ]; then
+            cp -a "${inner}/." "${PREFIX}/"
+          fi
+          test -f "${PREFIX}/lib/cmake/Pulp/PulpConfig.cmake" \
+            || { echo "::error::Unpacked SDK has no lib/cmake/Pulp/PulpConfig.cmake"; exit 1; }
+
+      - name: Verify SDK present
+        run: |
+          PREFIX="${{ steps.sdk.outputs.prefix }}"
+          test -f "${PREFIX}/lib/cmake/Pulp/PulpConfig.cmake" \
+            || { echo "::error::Pulp SDK not available at ${PREFIX} (cache miss + no tarball)."; exit 1; }
+          echo "SDK at ${PREFIX} (version $(cat "${PREFIX}/version.txt" 2>/dev/null || echo '?'))"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${{ steps.sdk.outputs.prefix }}"
+
+      - name: Build
+        run: cmake --build build -j"$(sysctl -n hw.ncpu)"
+
+      - name: Test (embed-smoke, headless/CPU)
+        run: ctest --test-dir build -R embed-smoke --output-on-failure
+
+      - name: Upload render artifacts + ctest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embed-smoke-macos
+          path: |
+            /tmp/pulp-embed-*.png
+            /tmp/embed-*.png
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+# ── Running the full GPU lane in a Tart VM ───────────────────────────────────
+# Hosted runners prove the dependency recipe + the headless render path. To run
+# the REAL GPU attach + live capture asserts, run the SAME build + ctest inside
+# a Pulp Tart golden VM where Apple Virtualization exposes Metal headless. From a
+# Pulp checkout on a CI host with the Tart lane (see Pulp's tart-ci skill and
+# docs/guides/local-ci.md):
+#
+#   # The golden bakes Skia + an installed Pulp SDK; clone, mount caches, build:
+#   tools/ci/tart-run-job.sh --repo <path-to-pulp-view-embed> \
+#     --cmd 'cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+#              -DCMAKE_PREFIX_PATH="$PULP_SDK_DIR" && \
+#            cmake --build build -j && \
+#            ctest --test-dir build -R embed-smoke --output-on-failure'
+#
+# Do NOT set PULP_EMBED_CI_NO_GPU in the VM — that lane is where active_backend
+# resolves to GPU and the M1.3 / live-capture asserts run for real.
