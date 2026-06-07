@@ -292,6 +292,17 @@ double pulp_embed_param_value(PulpEmbedView* view, int32_t index);
  * write is a no-op) so hosts can blind-push without first checking membership. */
 PulpEmbedResult pulp_embed_param_changed(PulpEmbedView* view, const char* key, double normalized);
 
+/* Headless input primitive (tests / automation): drive the control at `index`
+ * to the NORMALIZED [0,1] target through its REAL interaction path — the same
+ * gesture-begin -> value-change -> gesture-end sequence a mouse drag produces.
+ * For a knob/fader this fires on_gesture_begin, one or more on_change, then
+ * on_gesture_end (so the host sees begin_gesture / set_param(s) / end_gesture).
+ * For a toggle it flips on/off when the target crosses 0.5. Returns
+ * PULP_EMBED_ERR_INVALID_ARG for a NULL view or out-of-range index. This exists
+ * so a headless host harness can prove the UI->host direction without a window
+ * server; a real embedded UI is driven by the host's own mouse/touch events. */
+PulpEmbedResult pulp_embed_simulate_param_drag(PulpEmbedView* view, int32_t index, double target_normalized);
+
 /* ---- capture (tests / thumbnails) ------------------------------------ */
 
 /* Copy the current back buffer as PNG bytes into `out` (capacity `cap`).

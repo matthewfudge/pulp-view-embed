@@ -919,6 +919,48 @@ double pulp_embed_param_value(PulpEmbedView* v, int32_t index) {
         v->store->get_normalized(v->params[static_cast<size_t>(index)].param_id));
 }
 
+PulpEmbedResult pulp_embed_simulate_param_drag(PulpEmbedView* v, int32_t index, double target) {
+    if (!v || index < 0 || static_cast<size_t>(index) >= v->params.size())
+        return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto& b = v->params[static_cast<size_t>(index)];
+        auto* w = b.widget;
+        if (!w) return set_err(v, PULP_EMBED_ERR_INVALID_ARG, "param widget gone");
+        const float tgt = static_cast<float>(target < 0.0 ? 0.0 : (target > 1.0 ? 1.0 : target));
+
+        if (b.kind == ParamWidgetKind::knob) {
+            // Knob drag is delta-based: down records start value at start_y;
+            // drag up by (target-cur)*150 px reaches the target (widgets.cpp).
+            auto* k = static_cast<pulp::view::Knob*>(w);
+            const float cur = k->value();
+            const float y0 = 1000.0f;
+            k->on_mouse_down({0.0f, y0});                       // fires gesture_begin
+            k->on_mouse_drag({0.0f, y0 - (tgt - cur) * 150.0f}); // fires on_change
+            k->on_mouse_up({0.0f, y0 - (tgt - cur) * 150.0f});   // fires gesture_end
+        } else if (b.kind == ParamWidgetKind::fader) {
+            // Fader maps local position to value over its bounds.
+            auto* f = static_cast<pulp::view::Fader*>(w);
+            const auto lb = f->local_bounds();
+            // Vertical default: value = 1 - y/height. Compute the target y.
+            const float yh = lb.height > 0 ? lb.height : 150.0f;
+            const float y = (1.0f - tgt) * yh;
+            f->on_mouse_down({lb.width * 0.5f, y});  // begin + set
+            f->on_mouse_drag({lb.width * 0.5f, y});  // change
+            f->on_mouse_up({lb.width * 0.5f, y});    // end
+        } else {  // toggle
+            auto* t = static_cast<pulp::view::Toggle*>(w);
+            const bool want = tgt > 0.5f;
+            if (t->is_on() != want) t->on_mouse_down({0.0f, 0.0f});  // flips + fires on_toggle
+        }
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "simulate_param_drag threw");
+    }
+}
+
 PulpEmbedResult pulp_embed_param_changed(PulpEmbedView* v, const char* key, double normalized) {
     if (!v || !key || !v->store) return PULP_EMBED_ERR_INVALID_ARG;
     try {
