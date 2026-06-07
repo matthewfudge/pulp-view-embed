@@ -12,9 +12,11 @@
 #import <AppKit/AppKit.h>
 #include "pulp_view_embed.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -106,6 +108,51 @@ const char* backend_name(int b) {
         case PULP_EMBED_BACKEND_CPU: return "CPU";
         default: return "UNKNOWN";
     }
+}
+
+// ── M1.8 host-callback recorder ──────────────────────────────────────────
+// Captures the UI->host parameter traffic the embed forwards, so the gate can
+// assert the bidirectional flow without a DAW.
+struct HostParamLog {
+    int begin_count = 0;
+    int end_count = 0;
+    int set_count = 0;
+    std::string last_set_key;
+    double last_set_value = -1.0;
+    std::string last_begin_key;
+    std::string last_end_key;
+    // Host-side "automation state" keyed by param key (what a DAW would store).
+    std::vector<std::pair<std::string, double>> store;
+
+    double get(const std::string& key) const {
+        for (auto& kv : store) if (kv.first == key) return kv.second;
+        return -1.0;  // unknown
+    }
+    void put(const std::string& key, double v) {
+        for (auto& kv : store) if (kv.first == key) { kv.second = v; return; }
+        store.emplace_back(key, v);
+    }
+};
+
+void host_set_param(void* ctx, const char* key, double v) {
+    auto* log = static_cast<HostParamLog*>(ctx);
+    ++log->set_count;
+    log->last_set_key = key ? key : "";
+    log->last_set_value = v;
+    log->put(log->last_set_key, v);
+}
+double host_get_param(void* ctx, const char* key) {
+    return static_cast<HostParamLog*>(ctx)->get(key ? key : "");
+}
+void host_begin_gesture(void* ctx, const char* key) {
+    auto* log = static_cast<HostParamLog*>(ctx);
+    ++log->begin_count;
+    log->last_begin_key = key ? key : "";
+}
+void host_end_gesture(void* ctx, const char* key) {
+    auto* log = static_cast<HostParamLog*>(ctx);
+    ++log->end_count;
+    log->last_end_key = key ? key : "";
 }
 
 // M1.1 — create from a DesignIR JSON, no attach. Returns handle or null.
@@ -304,6 +351,131 @@ int main(int argc, const char* argv[]) {
                       "bundle render carries rasterized content (>0.10 B/px)");
                 [bwin close];
                 pulp_embed_destroy(bv);
+            }
+        }
+
+        // ── M1.8: interactive parameter bridge (ABI v2) ──────────────────
+        // Prove BIDIRECTIONAL host<->view param flow on the hi-fi bundle:
+        //   (1) enumerate params (count>0, keys match the design's controls),
+        //   (2) a simulated knob drag fires host begin/set/end with a changed
+        //       value (UI -> host),
+        //   (3) pulp_embed_param_changed pushes a host value into the widget
+        //       and the widget's value updates (host -> view),
+        //   (4) the host-driven push does NOT echo back to host.set_param.
+        std::printf("-- M1.8 parameter bridge (UI<->host) --\n");
+        {
+            HostParamLog log;
+            PulpEmbedDesc pd = make_desc(1000, 600, PULP_EMBED_BACKEND_PREF_AUTO);
+            pd.host_ctx = &log;
+            pd.host.set_param = host_set_param;
+            pd.host.get_param = host_get_param;
+            pd.host.begin_gesture = host_begin_gesture;
+            pd.host.end_gesture = host_end_gesture;
+
+            PulpEmbedView* pv = nullptr;
+            PulpEmbedResult pr =
+                pulp_embed_create_from_ui_bundle(&pd, bundle.c_str(), &pv);
+            if (pr != PULP_EMBED_OK) {
+                char buf[512];
+                pulp_embed_last_create_error(buf, sizeof(buf));
+                std::printf("    create(with host cb) failed: result=%d err=%s\n", pr, buf);
+            }
+            check(pr == PULP_EMBED_OK && pv != nullptr,
+                  "create_from_ui_bundle with host callbacks succeeds");
+
+            if (pv) {
+                // (1) enumeration
+                int n = pulp_embed_param_count(pv);
+                std::printf("    param_count = %d\n", n);
+                check(n > 0, "param_count > 0 (controls discovered)");
+
+                // Keys must be non-empty and match the createKnob ids in ui.js.
+                bool found_known_knob = false;
+                bool all_keys_nonempty = (n > 0);
+                int found_idx = -1;
+                for (int i = 0; i < n; ++i) {
+                    char key[128] = {0};
+                    size_t kl = pulp_embed_param_key(pv, i, key, sizeof key);
+                    if (kl == 0) all_keys_nonempty = false;
+                    if (std::string(key) == "Knob_Small47") {
+                        found_known_knob = true;
+                        found_idx = i;
+                    }
+                }
+                check(all_keys_nonempty, "every param key is non-empty");
+                check(found_known_knob,
+                      "a known design control key (Knob_Small47) is enumerated");
+
+                if (found_idx >= 0) {
+                    char widget_id[128] = {0};
+                    pulp_embed_param_widget_id(pv, found_idx, widget_id, sizeof widget_id);
+                    check(std::string(widget_id) == "Knob_Small47",
+                          "param widget_id matches the design control id");
+
+                    double before = pulp_embed_param_value(pv, found_idx);
+                    check(before >= 0.0 && before <= 1.0,
+                          "param value is a valid normalized number");
+
+                    // (2) UI -> host: simulate a drag to a value clearly
+                    // different from the seed, then assert the host saw a
+                    // begin / set(changed) / end sequence.
+                    double target = (before < 0.5) ? 0.85 : 0.15;
+                    int begin0 = log.begin_count, set0 = log.set_count, end0 = log.end_count;
+                    check(pulp_embed_simulate_param_drag(pv, found_idx, target) == PULP_EMBED_OK,
+                          "simulate_param_drag OK");
+                    check(log.begin_count == begin0 + 1, "host begin_gesture fired once");
+                    check(log.end_count == end0 + 1, "host end_gesture fired once");
+                    check(log.set_count > set0, "host set_param fired (>=1)");
+                    check(log.last_begin_key == "Knob_Small47" &&
+                          log.last_end_key == "Knob_Small47" &&
+                          log.last_set_key == "Knob_Small47",
+                          "host callbacks carried the correct param key");
+                    double after = pulp_embed_param_value(pv, found_idx);
+                    std::printf("    drag %.3f -> %.3f (host set=%.3f)\n",
+                                before, after, log.last_set_value);
+                    check(std::abs(after - before) > 0.05,
+                          "param value changed after drag (UI->host moved it)");
+                    check(std::abs(log.last_set_value - after) < 1e-3,
+                          "host set_param value matches the new param value");
+
+                    // (3) host -> view: push a host value and assert the
+                    // embedded widget picked it up.
+                    double pushed = (after < 0.5) ? 0.90 : 0.10;
+                    int set_before_push = log.set_count;
+                    check(pulp_embed_param_changed(pv, "Knob_Small47", pushed) == PULP_EMBED_OK,
+                          "param_changed(host->view) OK");
+                    double now = pulp_embed_param_value(pv, found_idx);
+                    std::printf("    host pushed %.3f -> widget value %.3f\n", pushed, now);
+                    check(std::abs(now - pushed) < 1e-3,
+                          "widget value reflects the host-pushed value");
+
+                    // (4) the host push must NOT re-enter host.set_param.
+                    check(log.set_count == set_before_push,
+                          "host->view push did NOT echo back to host.set_param (no loop)");
+
+                    // Re-render and confirm the host-driven value is visible:
+                    // the deterministic Skia render reflects the widget's value
+                    // (non-blank, content-bearing).
+                    auto rpng = render_to(pv, 1000, 600, "/tmp/embed-param-bridge.png");
+                    check(looks_nonblank(rpng, 1000, 600),
+                          "render after host param push is non-blank");
+
+                    // Visual proof the host->view push actually MOVES the knob:
+                    // push the opposite extreme and assert the rendered bytes
+                    // differ (the rotated indicator changes the PNG). Render is
+                    // deterministic, so any difference is the param change.
+                    double pushed2 = (pushed > 0.5) ? 0.05 : 0.95;
+                    pulp_embed_param_changed(pv, "Knob_Small47", pushed2);
+                    auto rpng2 = render_to(pv, 1000, 600, "/tmp/embed-param-bridge-2.png");
+                    check(!rpng2.empty() && rpng2 != rpng,
+                          "render visibly changes when the host moves the knob");
+
+                    // Unknown-key push is a tolerated no-op.
+                    check(pulp_embed_param_changed(pv, "no_such_param", 0.5) == PULP_EMBED_OK,
+                          "param_changed(unknown key) is a tolerated no-op");
+                }
+
+                pulp_embed_destroy(pv);
             }
         }
 
