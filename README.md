@@ -93,6 +93,39 @@ The committed `fixtures/figma-vst-style/bundle/ui.js` uses this relative form;
 the `embed-smoke` ctest reads the first `setImageSource` path as bundle-relative,
 so a freshly imported bundle must be portabilized before it round-trips.
 
+## Editing & hot-reload (the dev loop — no re-import per tweak)
+
+Re-importing from Figma/Claude is only for pulling *fresh* design changes. For
+day-to-day tweaking the design is just **data on disk** (the bundle's `ui.js` +
+`assets/`, or the DesignIR JSON), so you edit that and reload — you do not touch
+C++.
+
+**Live hot-reload while a host editor is open** (opt-in, off by default so it
+never ships in a release build):
+
+```bash
+# launch your JUCE/iPlug2 host (or the standalone) with dev hot-reload on:
+PULP_EMBED_HOT_RELOAD=1 open "Pulp Embed (JUCE).app"
+# then edit the bundle's ui.js and save — the open editor reloads live,
+# preserving widget values (Pulp's ScriptedUiSession HotReloader, pumped by the
+# embed's per-tick poll()). theme.json edits reload too.
+```
+
+Notes:
+- Dev hot-reload loads the bundle's `ui.js` **directly** (so the file watcher
+  watches the file you edit). Use the importer's default **absolute** asset
+  paths for the dev loop; the portabilized relative-path bundle uses the
+  production asset-resolver wrapper (which the watcher can't see).
+- It's gated on `PULP_EMBED_HOT_RELOAD` and uses a background file watcher only
+  in that mode — production builds run the plain load path, no watcher thread.
+- What's safe to hand-edit in `ui.js`: colors, positions/sizes, text, swap an
+  asset in `assets/`. Pulp's `lock_to_source` / `jsx_lock` keep anchored
+  hand-edits reconcilable across a later real re-import; `live_constant_editor`
+  is the basis for a constrained numeric dev-tweak UI.
+- Roadmap: an explicit `pulp_embed_reload_bundle()` ABI call (for an in-host
+  editor that rewrites the bundle programmatically) and adapter-side
+  debounced file-watch helpers — see the roadmap section.
+
 ## What you actually get (plain-English FAQ)
 
 **What is embedded?** A single rendered child view — the imported design,

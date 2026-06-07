@@ -164,12 +164,24 @@ public:
         // CLI's default `--emit js` output) pass through untouched, so this is a
         // no-op for those. The combined script is written next to ui.js as a
         // temp file and removed in the destructor.
-        effective_script_ = build_effective_script();
+        // Dev hot-reload (opt-in, off by default = production-safe): set
+        // PULP_EMBED_HOT_RELOAD=1 to live-reload the bundle while a host editor
+        // is open. It reuses Pulp's ScriptedUiSession HotReloader (background
+        // choc::file::Watcher → UI-thread poll_reload() with widget-value
+        // preservation), which the embed already pumps via the host idle tick
+        // (wire_scripted_session_to_host). The watcher watches the script that
+        // is loaded, so in dev mode we load the ORIGINAL ui.js directly (the
+        // file the developer edits) rather than the temp asset-resolver wrapper
+        // — dev bundles should therefore use the importer's default absolute
+        // asset paths (a portabilized relative bundle resolves assets via the
+        // wrapper, which is the production path). See the README dev-loop guide.
+        const bool dev_hot_reload = std::getenv("PULP_EMBED_HOT_RELOAD") != nullptr;
+        effective_script_ = dev_hot_reload ? script_path_ : build_effective_script();
 
         pulp::view::ScriptedUiOptions options;
         options.script_path = effective_script_;
-        options.enable_hot_reload = false;
-        options.enable_theme_reload = false;
+        options.enable_hot_reload = dev_hot_reload;
+        options.enable_theme_reload = dev_hot_reload;
         session_ = std::make_unique<pulp::view::ScriptedUiSession>(*root_, store_, std::move(options));
 
         std::string err;
