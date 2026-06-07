@@ -257,9 +257,9 @@ PulpEmbedResult pulp_embed_create_offscreen(const PulpEmbedDesc* desc,
  * always written to *w / *h (and *stride to the row byte count) so the caller
  * can size its buffer exactly.
  *
- * Two-call sizing pattern: pass out=NULL to learn *w/*h/*stride and the required
- * byte count (returned via *stride * *h; check against your buffer), then call
- * again with cap >= (*stride * *h). Returns PULP_EMBED_ERR_BUFFER_TOO_SMALL if
+ * Two-call sizing pattern: pass out=NULL to learn *w, *h, *stride and the
+ * required byte count (returned via (*stride) * (*h); check against your buffer),
+ * then call again with cap >= (*stride) * (*h). Returns PULP_EMBED_ERR_BUFFER_TOO_SMALL if
  * out != NULL but cap < required, and PULP_EMBED_ERR_UNSUPPORTED when no Skia
  * raster backend is available. Works for BOTH offscreen and windowed views (it
  * renders deterministically; it does not read a live back buffer — use
