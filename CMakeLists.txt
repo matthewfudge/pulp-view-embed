@@ -139,4 +139,11 @@ if(APPLE)
     add_executable(pulp-embed-bundle-render examples/macos-nsview-smoke/bundle_render.mm)
     target_link_libraries(pulp-embed-bundle-render PRIVATE
         pulp_view_embed "-framework AppKit")
+
+    # Sibling harness for the native DesignIR path — renders a DesignIR JSON
+    # (including the faithful-vector lane: faithful_svg nodes → DesignFrameView
+    # with native SVG-patch knobs + native overlay controls) to a PNG.
+    add_executable(pulp-embed-design-render examples/macos-nsview-smoke/design_render.mm)
+    target_link_libraries(pulp-embed-design-render PRIVATE
+        pulp_view_embed "-framework AppKit")
 endif()
