@@ -5,9 +5,11 @@ frontend (e.g. a design imported from Figma) as a rendered child view inside a
 **foreign C++ host** — JUCE, iPlug2, or a bespoke shell — without the host
 linking Pulp's C++ ABI.
 
-> Status: **experiment**. Render-only v1 (macOS) is working end to end. Not for
-> production yet. See `planning/2026-06-06-foreign-host-embedding-revised-plan.md`
-> in the Pulp repo for the roadmap.
+> Status: **experiment**. macOS is working end to end: high-fidelity render
+> **plus** an interactive host↔view parameter bridge (a dragged control moves a
+> host parameter; host automation moves the control). Not for production yet.
+> See `planning/2026-06-06-foreign-host-embedding-revised-plan.md` in the Pulp
+> repo for the roadmap.
 
 ## Why
 
@@ -43,10 +45,31 @@ pulp_embed_create_from_ui_bundle(&desc, "bundle", &view);   # renders that bundl
 - `pulp_embed_capture_png` — live GPU back-buffer capture.
 - Strict C error model: `PulpEmbedResult` everywhere, `last_error` /
   `last_create_error`, idempotent NULL-safe `destroy` with correct teardown order.
+- **Interactive parameter bridge (ABI v2)** — the design's controls are wired
+  bidirectionally to the host's parameters:
+  - `PulpEmbedDesc.host` carries the host callbacks (`set_param`, `get_param`,
+    `begin_gesture`, `end_gesture`, `read_meters`), each passed the host's
+    `host_ctx`.
+  - Parameters are addressed by **string key** — the design's `pulpParamKey`
+    when present, else the control's widget id. Enumerate them with
+    `pulp_embed_param_count` / `pulp_embed_param_key` / `pulp_embed_param_widget_id`
+    / `pulp_embed_param_value` and map each key to a host parameter once at
+    create time.
+  - UI → host: a dragged knob/fader fires `begin_gesture` → `set_param`(s) →
+    `end_gesture` (normalized [0,1]); a toggle click fires begin/set/end
+    atomically.
+  - host → UI: `pulp_embed_param_changed(view, key, normalized)` pushes
+    automation/preset values into the control and repaints — without echoing
+    back to `set_param` (no feedback loop).
+  - Mouse/keyboard already reach the controls through the GPU host's native
+    child view (`plugin_view_host_mac.mm` forwards `mouseDown:`/`Dragged:`/`Up:`
+    to the same widget handlers the bridge hooks); no extra forwarding needed.
+  - `pulp_embed_simulate_param_drag(view, index, target)` drives a control
+    through its real interaction path for headless host testing.
 
-The smoke (`examples/macos-nsview-smoke`) drives the M1.1–M1.7 gates: synthetic +
-Figma "VST Style" DesignIR, GPU attach/capture, CPU backend, 100× teardown, and
-the high-fidelity bundle render.
+The smoke (`examples/macos-nsview-smoke`) drives the M1.1–M1.8 gates: synthetic +
+Figma "VST Style" DesignIR, GPU attach/capture, CPU backend, 100× teardown, the
+high-fidelity bundle render, and the bidirectional parameter bridge.
 
 ## Build
 

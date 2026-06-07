@@ -9,7 +9,17 @@ text node, no assets. Isolates the embed lifecycle (parse → materialize → at
 
 ## `figma-vst-style/`
 The real "VST Style" plugin frame (1000×600) from the test Figma file
-`KCKIyZoWXjde6qVNCm4qPa`, node `3:42`. Used by M1.4 (real-design render).
+`KCKIyZoWXjde6qVNCm4qPa`, node `3:42`. Used by M1.4 (real-design render) and
+M1.8 (parameter bridge).
+
+Parameter-bridge note: this design carries **no** `pulpParamKey` binding
+metadata and **no** meter widgets — it's a visual export of 15 knobs. The embed
+therefore derives one parameter per bindable control, keyed by the control's
+widget id (e.g. `Knob_Small47`). M1.8 enumerates those 15 params and exercises
+the bidirectional flow against them. When a design DOES carry `pulpParamKey`
+metadata (or meter bindings), those keys take over as the param identity and
+meters route through the AudioBridge — but that path is unexercised by this
+fixture.
 
 Regenerate:
 
