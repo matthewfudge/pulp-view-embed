@@ -147,8 +147,20 @@ Notes:
   bundle path only. This is the on-demand counterpart to the file-watched
   `PULP_EMBED_HOT_RELOAD` dev flag — drive it from an in-host editor or a
   debounced adapter file-watcher.
-- Roadmap: adapter-side debounced file-watch helpers (JUCE Timer / iPlug2 timer
-  polling mtimes → `pulp_embed_reload_bundle`).
+- **Adapter file-watchers (shipped):** `PulpEmbedComponent` (JUCE) and
+  `PulpEmbedEditor` (iPlug2) auto-arm a debounced `ui.js` mtime watcher when
+  `PULP_EMBED_HOT_RELOAD` is set (on their existing timer) → `reload_bundle` on
+  save. `enableBundleHotReload(bool)` forces it.
+
+**Longer-horizon (need a toolchain / infra / bigger design, not quick niceties):**
+- Windows/Linux host **compile-verify** — the HWND/X11 `PluginViewHost` code is
+  in; verifying needs a Windows+Skia (and Linux+Skia) toolchain.
+- `pulp add`-style packaged distribution — needs the core package-registry infra.
+- Zero-copy GPU compositing — the offscreen path currently does a CPU RGBA
+  readback; eliminating it is a render-pipeline change.
+- `text_field` host binding — the ABI parameter model is normalized floats; a
+  text control would need a string-parameter ABI surface (it stays in-view
+  interactive today).
 
 ## What you actually get (plain-English FAQ)
 
