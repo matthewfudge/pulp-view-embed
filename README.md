@@ -159,6 +159,15 @@ ctest --test-dir build --output-on-failure   # runs the macOS embed smoke
 `-DPULP_VIEW_EMBED_SHARED=ON` builds `libpulp_view_embed.dylib` (a stable ABI a
 foreign host links without seeing Pulp C++ symbols); default is a static lib.
 
+## Distribution
+
+To ship this to a foreign host that does **not** build Pulp from source, see
+[`DISTRIBUTING.md`](DISTRIBUTING.md): the cargo-like package manifest
+(`pulp-package.json`), the relocatable shared-library dist with a
+`find_package(pulp_view_embed)` config and a symbol surface pinned to the C ABI,
+the published-SDK tarball recipe (`tools/package-sdk.sh`), and the
+codesign/notarize steps.
+
 ## Layout
 
 ```
