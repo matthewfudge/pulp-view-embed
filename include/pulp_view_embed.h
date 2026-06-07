@@ -313,8 +313,15 @@ PulpEmbedResult pulp_embed_attach(PulpEmbedView* view, void* parent_native_handl
  * view-closed if it had been opened. Safe (OK) if not attached. */
 PulpEmbedResult pulp_embed_detach(PulpEmbedView* view);
 
-/* Resize the embedded view. width/height are logical pixels; scale is the DPI
- * scale (pass the same width/height with a new scale to signal a DPI change). */
+/* Resize the embedded view. width/height are LOGICAL pixels.
+ *
+ * `scale` is validated (must be finite and > 0, else PULP_EMBED_ERR_INVALID_ARG)
+ * but ADVISORY for this windowed/native-embed path: a Pulp-parented or
+ * host-parented child surface derives its backing-store DPI from the host's
+ * NSWindow (backingScaleFactor), which Pulp does not override here. Only the
+ * deterministic capture APIs (pulp_embed_render_png / pulp_embed_render_frame_rgba)
+ * honor a caller-supplied scale for pixel density. Pass the same width/height
+ * with a new scale to signal a DPI change for hosts that treat it as a hint. */
 PulpEmbedResult pulp_embed_resize(PulpEmbedView* view, int32_t width, int32_t height, float scale);
 
 /* Pump one host idle tick so a scripted UI's poll()/timers/rAF keep running.

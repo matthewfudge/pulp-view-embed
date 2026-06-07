@@ -755,6 +755,111 @@ int main(int argc, const char* argv[]) {
             }
         }
 
+        // ── M1.11: resize / scale / DPI stress ───────────────────────────
+        // Attach the hi-fi figma bundle to a live window, then drive MANY
+        // resize cycles across a wide size range, several non-design aspect
+        // ratios, and DPI scale changes (1.0, 2.0). Each cycle ticks + renders
+        // deterministically and at the live size, asserting: no crash, a valid
+        // result code, and a non-blank render at every size. Loops 50+ cycles
+        // so a leak or a per-resize surface bug surfaces as a crash/blank.
+        std::printf("-- M1.11 resize / scale / DPI stress --\n");
+        {
+            PulpEmbedDesc rd = make_desc(1000, 600, PULP_EMBED_BACKEND_PREF_AUTO);
+            PulpEmbedView* rv = nullptr;
+            PulpEmbedResult rr =
+                pulp_embed_create_from_ui_bundle(&rd, bundle.c_str(), &rv);
+            check(rr == PULP_EMBED_OK && rv != nullptr,
+                  "resize-stress create_from_ui_bundle succeeds");
+            if (rv) {
+                NSWindow* rwin = make_offscreen_window(1000, 600);
+                check(pulp_embed_attach(rv, (__bridge void*)rwin.contentView) == PULP_EMBED_OK,
+                      "resize-stress attach OK");
+
+                // A spread of sizes: design size, small floor, large ceiling,
+                // and several deliberately NON-design aspect ratios (ultra-wide,
+                // tall, square) that the design-viewport letterbox must absorb
+                // without crashing or blanking.
+                struct Sz { int w, h; };
+                const Sz sizes[] = {
+                    {1000, 600},  // design
+                    {200, 120},   // small floor
+                    {1600, 960},  // large, design aspect
+                    {1600, 200},  // ultra-wide (non-design aspect)
+                    {300, 900},   // tall (non-design aspect)
+                    {640, 640},   // square (non-design aspect)
+                    {1280, 720},  // 16:9
+                    {800, 600},   // 4:3
+                };
+                const float scales[] = {1.0f, 2.0f};
+                const int n_sizes = int(sizeof(sizes) / sizeof(sizes[0]));
+
+                int cycles = 0, resize_ok = 0, nonblank = 0, render_ok = 0;
+                int blank_at_size = -1;
+                // 8 sizes * 2 scales = 16 per pass; >=4 passes -> 64 cycles.
+                for (int pass = 0; pass < 4; ++pass) {
+                    for (int s = 0; s < n_sizes; ++s) {
+                        for (float scale : scales) {
+                            ++cycles;
+                            const int w = sizes[s].w, h = sizes[s].h;
+                            if (pulp_embed_resize(rv, w, h, scale) == PULP_EMBED_OK)
+                                ++resize_ok;
+                            // size_hints must still answer post-resize.
+                            PulpEmbedSizeHints sh{};
+                            pulp_embed_size_hints(rv, &sh);
+                            pulp_embed_tick(rv);
+                            pump(1);  // service the display-link once
+
+                            // Deterministic render at the resized logical size
+                            // (honors scale for pixel density). Assert non-blank.
+                            size_t need = 0;
+                            const int pw = int(w * scale), ph = int(h * scale);
+                            if (pulp_embed_render_png(rv, w, h, scale, nullptr, 0, &need)
+                                    == PULP_EMBED_OK && need) {
+                                std::vector<uint8_t> png(need);
+                                if (pulp_embed_render_png(rv, w, h, scale, png.data(),
+                                                          png.size(), &need) == PULP_EMBED_OK) {
+                                    ++render_ok;
+                                    if (looks_nonblank(png, pw, ph)) ++nonblank;
+                                    else if (blank_at_size < 0) blank_at_size = s;
+                                }
+                            }
+                        }
+                    }
+                }
+                std::printf("    cycles=%d resize_ok=%d render_ok=%d nonblank=%d\n",
+                            cycles, resize_ok, render_ok, nonblank);
+                check(cycles >= 50, "ran 50+ resize cycles");
+                check(resize_ok == cycles, "every resize returned OK");
+                check(render_ok == cycles, "every resized render produced a PNG");
+                check(nonblank == cycles, "every resized render is non-blank");
+                if (blank_at_size >= 0)
+                    std::printf("    first blank at size index %d (%dx%d)\n",
+                                blank_at_size, sizes[blank_at_size].w,
+                                sizes[blank_at_size].h);
+
+                // Invalid scale must be rejected, not silently dropped.
+                check(pulp_embed_resize(rv, 800, 600, 0.0f) == PULP_EMBED_ERR_INVALID_ARG,
+                      "resize(scale=0) -> INVALID_ARG");
+                check(pulp_embed_resize(rv, 800, 600, -1.0f) == PULP_EMBED_ERR_INVALID_ARG,
+                      "resize(scale<0) -> INVALID_ARG");
+                check(pulp_embed_resize(rv, 800, 600, std::nanf("")) == PULP_EMBED_ERR_INVALID_ARG,
+                      "resize(scale=NaN) -> INVALID_ARG");
+                // Degenerate dimensions still rejected.
+                check(pulp_embed_resize(rv, 0, 600, 1.0f) == PULP_EMBED_ERR_INVALID_ARG,
+                      "resize(width=0) -> INVALID_ARG");
+
+                // Settle back to design size and prove the view still renders.
+                check(pulp_embed_resize(rv, 1000, 600, 1.0f) == PULP_EMBED_OK,
+                      "resize back to design size OK");
+                auto settled = render_to(rv, 1000, 600, "/tmp/embed-resize-settled.png");
+                check(looks_nonblank(settled, 1000, 600),
+                      "render after resize-stress is non-blank");
+
+                [rwin close];
+                pulp_embed_destroy(rv);
+            }
+        }
+
         std::printf("== %d failure(s) ==\n", g_failures);
         return g_failures == 0 ? 0 : 1;
     }

@@ -27,6 +27,7 @@
 #include <pulp/view/widgets.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -1064,8 +1065,15 @@ PulpEmbedResult pulp_embed_detach(PulpEmbedView* v) {
     }
 }
 
-PulpEmbedResult pulp_embed_resize(PulpEmbedView* v, int32_t w, int32_t h, float /*scale*/) {
+PulpEmbedResult pulp_embed_resize(PulpEmbedView* v, int32_t w, int32_t h, float scale) {
     if (!v || !v->host || !v->bridge || w <= 0 || h <= 0) return PULP_EMBED_ERR_INVALID_ARG;
+    // `scale` is validated but advisory for the windowed/native embed path:
+    // PluginViewHost has no backing-scale setter — the attached NSWindow's
+    // backingScaleFactor drives surface DPI. Only the explicit deterministic
+    // capture APIs (pulp_embed_render_png / pulp_embed_render_frame_rgba) honor
+    // a caller-supplied scale. We still reject a non-finite/non-positive scale
+    // so a host bug surfaces here instead of producing a degenerate surface.
+    if (!(scale > 0.0f) || !std::isfinite(scale)) return PULP_EMBED_ERR_INVALID_ARG;
     try {
         v->host->set_size(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
         if (auto* rv = v->bridge->view()) {
