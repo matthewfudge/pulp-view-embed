@@ -34,8 +34,15 @@
 extern "C" {
 #endif
 
-/* Bump when the struct/function layout changes incompatibly. */
-#define PULP_VIEW_EMBED_ABI_VERSION 1u
+/* Bump when the struct/function layout changes incompatibly.
+ *
+ * v2 (2026-06): added the host<->view parameter bridge. PulpEmbedDesc grew a
+ * trailing `host` callbacks block (after `host_ctx`); the param-enumeration and
+ * pulp_embed_param_changed() functions were added. The desc growth is
+ * struct_size-gated, so a v1 caller's smaller desc is still accepted (the new
+ * tail reads as zero/NULL = "no host bridge"), and a v2 library accepts a v1
+ * desc. abi_version is therefore validated as "<= library version", not "==". */
+#define PULP_VIEW_EMBED_ABI_VERSION 2u
 
 /* Opaque embedded-view handle. */
 typedef struct PulpEmbedView PulpEmbedView;
@@ -67,6 +74,46 @@ typedef enum PulpEmbedBackend {
     PULP_EMBED_BACKEND_CPU     = 2   /* incl. a GPU preference that fell back */
 } PulpEmbedBackend;
 
+/* ---- host parameter bridge (ABI v2) ----------------------------------- *
+ *
+ * The host wires a design's controls to ITS parameters by supplying these
+ * callbacks in PulpEmbedDesc.host. Every callback carries the host's opaque
+ * `host_ctx` (PulpEmbedDesc.host_ctx) back unchanged. Parameters are addressed
+ * by their string KEY (the design's pulpParamKey, or — when a control carries
+ * no binding metadata — its widget id). Use the param-enumeration functions
+ * (pulp_embed_param_count / _key / _widget_id) to map each design key to a host
+ * parameter once, right after creation.
+ *
+ * Direction UI -> host (a user dragging a knob): Pulp fires begin_gesture, then
+ * one or more set_param(value), then end_gesture. `value` is NORMALIZED [0,1]
+ * — the host denormalizes against its own range. A control without explicit
+ * gesture phases (a toggle click) fires begin -> set -> end synchronously.
+ *
+ * Direction host -> UI (automation / preset recall): the host calls
+ * pulp_embed_param_changed(view, key, value) to push a normalized value into
+ * the matching control; the widget repaints. That path does NOT re-enter
+ * set_param (no feedback loop).
+ *
+ * read_meters is polled from pulp_embed_tick(): the host writes up to `cap`
+ * normalized [0,1] level samples into `out` and returns the count written.
+ * Designs without meters ignore it.
+ *
+ * All callbacks are optional — a NULL slot disables that direction. Every
+ * callback runs on the host UI thread (same constraint as the rest of the ABI).
+ */
+typedef void   (*PulpEmbedSetParamFn)(void* host_ctx, const char* key, double normalized);
+typedef double (*PulpEmbedGetParamFn)(void* host_ctx, const char* key);
+typedef void   (*PulpEmbedGestureFn)(void* host_ctx, const char* key);
+typedef int32_t (*PulpEmbedReadMetersFn)(void* host_ctx, float* out, int32_t cap);
+
+typedef struct PulpEmbedHostCallbacks {
+    PulpEmbedSetParamFn   set_param;     /* UI gesture -> host param write      */
+    PulpEmbedGetParamFn   get_param;     /* host -> view initial-value pull     */
+    PulpEmbedGestureFn    begin_gesture; /* UI gesture begin (undo grouping)    */
+    PulpEmbedGestureFn    end_gesture;   /* UI gesture end                      */
+    PulpEmbedReadMetersFn read_meters;   /* polled from tick(); may be NULL     */
+} PulpEmbedHostCallbacks;
+
 /* Creation descriptor. Zero-initialize, then set struct_size = sizeof(*desc),
  * abi_version = PULP_VIEW_EMBED_ABI_VERSION, and the sizing fields. */
 typedef struct PulpEmbedDesc {
@@ -80,7 +127,11 @@ typedef struct PulpEmbedDesc {
     int32_t     design_height;
     const char* asset_base_path; /* base dir for relative asset paths when    */
                                  /* creating from a JSON string; may be NULL  */
-    void*       host_ctx;        /* opaque; reserved for future param/meter cbs */
+    void*       host_ctx;        /* opaque; passed back to every host.* cb     */
+
+    /* ABI v2 tail — struct_size-gated. A v1 caller (smaller struct_size) omits
+     * this; the shim treats the absent block as all-NULL (no host bridge). */
+    PulpEmbedHostCallbacks host; /* host parameter/meter callbacks; all opt.  */
 } PulpEmbedDesc;
 
 /* Resize constraints derived from the imported design (pulp_embed_size_hints). */
@@ -199,6 +250,47 @@ PulpEmbedResult pulp_embed_size_hints(PulpEmbedView* view, PulpEmbedSizeHints* o
  * preference that failed to initialize reports PULP_EMBED_BACKEND_CPU. Returns
  * PULP_EMBED_BACKEND_UNKNOWN for a NULL/uninitialized view. */
 int32_t pulp_embed_active_backend(PulpEmbedView* view);
+
+/* ---- parameter bridge (ABI v2) --------------------------------------- *
+ *
+ * After creation, the view exposes an ORDERED, stable list of bindable
+ * parameters discovered in the design (one per bindable control: knob, fader,
+ * toggle). Each entry has a string KEY (the design's pulpParamKey when present,
+ * else the control's widget id) and the widget id it drives. Index order is
+ * stable for the lifetime of the view, so a host can enumerate once at create
+ * time and address parameters by index internally if it prefers.
+ *
+ * Map design -> host like:
+ *   int n = pulp_embed_param_count(view);
+ *   for (int i = 0; i < n; ++i) {
+ *       char key[128]; pulp_embed_param_key(view, i, key, sizeof key);
+ *       host_bind(key);   // resolve key to a host parameter id
+ *   }
+ */
+
+/* Number of bindable parameters discovered in the design (>= 0). */
+int32_t pulp_embed_param_count(PulpEmbedView* view);
+
+/* Copy the parameter's string key at `index` into buf (NUL-terminated,
+ * truncated to cap). Returns the full key length excluding the NUL, or 0 for an
+ * out-of-range index / NULL view. */
+size_t pulp_embed_param_key(PulpEmbedView* view, int32_t index, char* buf, size_t cap);
+
+/* Copy the widget id driven by the parameter at `index` (often identical to the
+ * key). Same buffer/return contract as pulp_embed_param_key. */
+size_t pulp_embed_param_widget_id(PulpEmbedView* view, int32_t index, char* buf, size_t cap);
+
+/* Current NORMALIZED [0,1] value of the parameter at `index`, or a negative
+ * value for an out-of-range index / NULL view. */
+double pulp_embed_param_value(PulpEmbedView* view, int32_t index);
+
+/* Host -> view: push a NORMALIZED [0,1] value for the parameter identified by
+ * `key` (host automation, preset recall, get_param sync). Updates the embed's
+ * StateStore, sets the matching widget's value, and repaints. Does NOT call
+ * back into host.set_param (no feedback loop). Returns PULP_EMBED_ERR_INVALID_ARG
+ * for a NULL view/key, and PULP_EMBED_OK even if `key` matches no control (the
+ * write is a no-op) so hosts can blind-push without first checking membership. */
+PulpEmbedResult pulp_embed_param_changed(PulpEmbedView* view, const char* key, double normalized);
 
 /* ---- capture (tests / thumbnails) ------------------------------------ */
 
