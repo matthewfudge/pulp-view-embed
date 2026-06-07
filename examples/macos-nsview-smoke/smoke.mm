@@ -155,6 +155,89 @@ void host_end_gesture(void* ctx, const char* key) {
     log->last_end_key = key ? key : "";
 }
 
+// ── M1.9 resolve_resource recorder ───────────────────────────────────────
+// Serves one design asset's bytes from memory; records which ids were asked
+// for, so the gate can assert the host callback path drove asset loading.
+struct ResourceServer {
+    std::string serve_id;                 // the one id we answer
+    std::vector<uint8_t> serve_bytes;     // bytes returned for serve_id
+    std::vector<std::string> asked;       // every id the shim offered us
+};
+
+const uint8_t* host_resolve_resource(void* ctx, const char* id, size_t* out_len) {
+    auto* rs = static_cast<ResourceServer*>(ctx);
+    rs->asked.emplace_back(id ? id : "");
+    if (id && rs->serve_id == id && !rs->serve_bytes.empty()) {
+        if (out_len) *out_len = rs->serve_bytes.size();
+        return rs->serve_bytes.data();   // borrowed; valid through creation
+    }
+    return nullptr;                       // disk fallback
+}
+
+std::vector<uint8_t> read_file_bytes(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> bytes(n > 0 ? static_cast<size_t>(n) : 0);
+    if (!bytes.empty()) {
+        size_t got = std::fread(bytes.data(), 1, bytes.size(), f);
+        bytes.resize(got);
+    }
+    std::fclose(f);
+    return bytes;
+}
+
+// First setImageSource(...,'<path>') path argument in a ui.js — used as the
+// asset id the host serves.
+std::string first_image_asset_id(const std::string& ui_js) {
+    const char* needle = "setImageSource(";
+    size_t p = ui_js.find(needle);
+    if (p == std::string::npos) return {};
+    // skip to the comma after the id, then the opening quote of the path.
+    size_t comma = ui_js.find(',', p);
+    if (comma == std::string::npos) return {};
+    size_t q1 = ui_js.find_first_of("'\"", comma);
+    if (q1 == std::string::npos) return {};
+    char quote = ui_js[q1];
+    size_t q2 = ui_js.find(quote, q1 + 1);
+    if (q2 == std::string::npos) return {};
+    return ui_js.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// Pull a deterministic RGBA frame. Returns pixels; writes w/h/stride. Works for
+// both windowed and offscreen views (deterministic renderer, not a back buffer).
+std::vector<uint8_t> pull_rgba(PulpEmbedView* v, int w, int h, float scale,
+                               int* ow, int* oh, int* ostride) {
+    int pw = 0, ph = 0, stride = 0;
+    if (pulp_embed_render_frame_rgba(v, w, h, scale, nullptr, 0, &pw, &ph, &stride)
+            != PULP_EMBED_OK || pw <= 0 || ph <= 0)
+        return {};
+    std::vector<uint8_t> px(static_cast<size_t>(stride) * static_cast<size_t>(ph));
+    if (pulp_embed_render_frame_rgba(v, w, h, scale, px.data(), px.size(),
+                                     &pw, &ph, &stride) != PULP_EMBED_OK)
+        return {};
+    if (ow) *ow = pw; if (oh) *oh = ph; if (ostride) *ostride = stride;
+    return px;
+}
+
+// Fraction of pixels that differ by more than a small per-channel tolerance.
+double rgba_diff_fraction(const std::vector<uint8_t>& a,
+                          const std::vector<uint8_t>& b) {
+    if (a.size() != b.size() || a.empty()) return 1.0;
+    size_t differing = 0;
+    const size_t pixels = a.size() / 4;
+    for (size_t i = 0; i < pixels; ++i) {
+        int da = std::abs(int(a[i*4+0]) - int(b[i*4+0]));
+        int dg = std::abs(int(a[i*4+1]) - int(b[i*4+1]));
+        int db = std::abs(int(a[i*4+2]) - int(b[i*4+2]));
+        int dal = std::abs(int(a[i*4+3]) - int(b[i*4+3]));
+        if (da > 4 || dg > 4 || db > 4 || dal > 4) ++differing;
+    }
+    return double(differing) / double(pixels);
+}
+
 // M1.1 — create from a DesignIR JSON, no attach. Returns handle or null.
 PulpEmbedView* create_from(const std::string& path, PulpEmbedBackendPref pref,
                            int w, int h) {
@@ -476,6 +559,199 @@ int main(int argc, const char* argv[]) {
                 }
 
                 pulp_embed_destroy(pv);
+            }
+        }
+
+        // ── M1.9: resolve_resource host callback (ABI v3) ────────────────
+        // Serve ONE asset's bytes via the host callback and assert the same
+        // pixels render as the on-disk path; then serve DIFFERENT bytes for
+        // that asset and assert the render changes (the host path is really
+        // driving the asset load, not disk).
+        std::printf("-- M1.9 resolve_resource (host asset bytes) --\n");
+        {
+            const std::string ui_path = bundle + "/ui.js";
+            std::vector<uint8_t> ui_bytes = read_file_bytes(ui_path);
+            const std::string ui_js(
+                reinterpret_cast<const char*>(ui_bytes.data()), ui_bytes.size());
+            const std::string asset_id = first_image_asset_id(ui_js);
+            check(!asset_id.empty(), "found an image asset id in ui.js");
+            // The on-disk bytes for that asset (id is bundle-relative).
+            const std::string asset_disk = bundle + "/" + asset_id;
+            std::vector<uint8_t> real_bytes = read_file_bytes(asset_disk);
+            check(!real_bytes.empty(), "read the asset's on-disk bytes");
+
+            // Baseline: pure disk render (no resource callback).
+            int dw = 0, dh = 0, ds = 0;
+            std::vector<uint8_t> disk_px;
+            {
+                PulpEmbedDesc bd = make_desc(1000, 600, PULP_EMBED_BACKEND_PREF_AUTO);
+                PulpEmbedView* dv = nullptr;
+                check(pulp_embed_create_from_ui_bundle(&bd, bundle.c_str(), &dv) == PULP_EMBED_OK,
+                      "disk-baseline create OK");
+                if (dv) {
+                    disk_px = pull_rgba(dv, 1000, 600, 1.0f, &dw, &dh, &ds);
+                    check(!disk_px.empty(), "disk-baseline RGBA frame non-empty");
+                    pulp_embed_destroy(dv);
+                }
+            }
+
+            // Host serves the SAME bytes the disk has -> render must match.
+            if (!asset_id.empty() && !real_bytes.empty() && !disk_px.empty()) {
+                ResourceServer rs;
+                rs.serve_id = asset_id;
+                rs.serve_bytes = real_bytes;
+                PulpEmbedDesc hd = make_desc(1000, 600, PULP_EMBED_BACKEND_PREF_AUTO);
+                hd.host_ctx = &rs;
+                hd.host.resolve_resource = host_resolve_resource;
+                PulpEmbedView* hv = nullptr;
+                check(pulp_embed_create_from_ui_bundle(&hd, bundle.c_str(), &hv) == PULP_EMBED_OK,
+                      "create with resolve_resource OK");
+                if (hv) {
+                    check(!rs.asked.empty(), "shim consulted resolve_resource (>=1 id)");
+                    bool offered = false;
+                    for (auto& a : rs.asked) if (a == asset_id) offered = true;
+                    check(offered, "shim offered the known asset id to the host");
+
+                    int hw = 0, hh = 0, hs = 0;
+                    std::vector<uint8_t> host_px = pull_rgba(hv, 1000, 600, 1.0f, &hw, &hh, &hs);
+                    check(!host_px.empty(), "host-served RGBA frame non-empty");
+                    double same_diff = rgba_diff_fraction(disk_px, host_px);
+                    std::printf("    host(same-bytes) vs disk diff = %.5f\n", same_diff);
+                    check(same_diff < 0.001,
+                          "host-served-same-bytes render matches the disk render");
+                    pulp_embed_destroy(hv);
+                }
+
+                // Negative control: serve a DIFFERENT image (a tiny solid PNG)
+                // for that asset and assert the render visibly differs.
+                // Reuse a different asset's bytes from the bundle as the "wrong"
+                // image so we know it decodes.
+                std::string other_id;
+                {
+                    size_t p2 = ui_js.find("setImageSource(", ui_js.find("setImageSource(") + 1);
+                    if (p2 != std::string::npos) {
+                        std::string rest = ui_js.substr(p2);
+                        other_id = first_image_asset_id(rest);
+                    }
+                }
+                std::vector<uint8_t> other_bytes =
+                    other_id.empty() ? std::vector<uint8_t>() : read_file_bytes(bundle + "/" + other_id);
+                if (!other_bytes.empty() && other_id != asset_id) {
+                    ResourceServer rs2;
+                    rs2.serve_id = asset_id;        // same slot…
+                    rs2.serve_bytes = other_bytes;  // …different image
+                    PulpEmbedDesc nd = make_desc(1000, 600, PULP_EMBED_BACKEND_PREF_AUTO);
+                    nd.host_ctx = &rs2;
+                    nd.host.resolve_resource = host_resolve_resource;
+                    PulpEmbedView* nv = nullptr;
+                    if (pulp_embed_create_from_ui_bundle(&nd, bundle.c_str(), &nv) == PULP_EMBED_OK && nv) {
+                        int nw = 0, nh = 0, ns = 0;
+                        std::vector<uint8_t> npx = pull_rgba(nv, 1000, 600, 1.0f, &nw, &nh, &ns);
+                        double diff = rgba_diff_fraction(disk_px, npx);
+                        std::printf("    host(other-bytes) vs disk diff = %.5f\n", diff);
+                        check(diff > 0.0005,
+                              "host serving DIFFERENT bytes changes the render (callback drives load)");
+                        pulp_embed_destroy(nv);
+                    }
+                }
+            }
+
+            // DesignIR path: resolve_resource is wired there too (assets key on
+            // the manifest local_path). Prove the shim consults the host for the
+            // native-tree create path, not just the scripted bundle.
+            {
+                ResourceServer rs;
+                rs.serve_id = "__none__";  // serve nothing -> pure disk fallback
+                PulpEmbedDesc dd = make_desc(1000, 600, PULP_EMBED_BACKEND_PREF_AUTO);
+                dd.host_ctx = &rs;
+                dd.host.resolve_resource = host_resolve_resource;
+                PulpEmbedView* dv2 = nullptr;
+                if (pulp_embed_create_from_design_json(&dd, figma.c_str(), &dv2) == PULP_EMBED_OK && dv2) {
+                    check(!rs.asked.empty(),
+                          "DesignIR path consults resolve_resource for its assets");
+                    pulp_embed_destroy(dv2);
+                }
+            }
+        }
+
+        // ── M1.10: offscreen / texture render mode (ABI v3) ──────────────
+        // Create offscreen from the figma bundle (no parent window), pull a
+        // CPU-readable RGBA frame, assert it's non-blank, and assert it matches
+        // the WINDOWED render of the same bundle (deterministic renderer).
+        std::printf("-- M1.10 offscreen render mode --\n");
+        {
+            PulpEmbedDesc od = make_desc(1000, 600, PULP_EMBED_BACKEND_PREF_AUTO);
+            PulpEmbedView* ov = nullptr;
+            PulpEmbedResult orr =
+                pulp_embed_create_offscreen(&od, bundle.c_str(), /*from_bundle=*/1, &ov);
+            if (orr != PULP_EMBED_OK) {
+                char buf[512];
+                pulp_embed_last_create_error(buf, sizeof(buf));
+                std::printf("    create_offscreen failed: result=%d err=%s\n", orr, buf);
+            }
+            check(orr == PULP_EMBED_OK && ov != nullptr, "create_offscreen(bundle) succeeds");
+
+            if (ov) {
+                // No live host: offscreen reports CPU and refuses attach.
+                check(pulp_embed_active_backend(ov) == PULP_EMBED_BACKEND_CPU,
+                      "offscreen view reports CPU backend (no live host)");
+                check(pulp_embed_attach(ov, nullptr) == PULP_EMBED_ERR_INVALID_ARG,
+                      "offscreen attach is rejected (no host)");
+
+                // Sizing query first.
+                int qw = 0, qh = 0, qs = 0;
+                check(pulp_embed_render_frame_rgba(ov, 1000, 600, 1.0f, nullptr, 0,
+                                                   &qw, &qh, &qs) == PULP_EMBED_OK,
+                      "render_frame_rgba sizing query OK");
+                check(qw == 1000 && qh == 600 && qs == 1000 * 4,
+                      "offscreen frame dims + stride correct (RGBA8, scale 1)");
+
+                // Buffer-too-small contract.
+                uint8_t tiny[16];
+                int tw = 0, th = 0, ts = 0;
+                check(pulp_embed_render_frame_rgba(ov, 1000, 600, 1.0f, tiny, sizeof tiny,
+                                                   &tw, &th, &ts) == PULP_EMBED_ERR_BUFFER_TOO_SMALL,
+                      "render_frame_rgba into tiny buffer -> BUFFER_TOO_SMALL");
+
+                int ow = 0, oh = 0, os = 0;
+                std::vector<uint8_t> off_px = pull_rgba(ov, 1000, 600, 1.0f, &ow, &oh, &os);
+                check(!off_px.empty(), "offscreen RGBA frame non-empty");
+                // Non-blank: a real frame has many distinct pixels vs a flat fill.
+                {
+                    size_t distinct = 0;
+                    if (off_px.size() >= 4) {
+                        const uint8_t* p0 = off_px.data();
+                        for (size_t i = 4; i < off_px.size(); i += 4)
+                            if (off_px[i] != p0[0] || off_px[i+1] != p0[1] ||
+                                off_px[i+2] != p0[2]) { ++distinct; }
+                    }
+                    check(distinct > 1000, "offscreen frame is non-blank (varied pixels)");
+                }
+
+                // Matches the WINDOWED render of the same bundle.
+                std::vector<uint8_t> win_px;
+                {
+                    PulpEmbedDesc wd = make_desc(1000, 600, PULP_EMBED_BACKEND_PREF_AUTO);
+                    PulpEmbedView* wv = nullptr;
+                    if (pulp_embed_create_from_ui_bundle(&wd, bundle.c_str(), &wv) == PULP_EMBED_OK && wv) {
+                        NSWindow* wwin = make_offscreen_window(1000, 600);
+                        pulp_embed_attach(wv, (__bridge void*)wwin.contentView);
+                        pump(10);
+                        int wpw = 0, wph = 0, wps = 0;
+                        win_px = pull_rgba(wv, 1000, 600, 1.0f, &wpw, &wph, &wps);
+                        [wwin close];
+                        pulp_embed_destroy(wv);
+                    }
+                }
+                check(!win_px.empty(), "windowed reference RGBA frame non-empty");
+                if (!win_px.empty() && !off_px.empty()) {
+                    double diff = rgba_diff_fraction(win_px, off_px);
+                    std::printf("    offscreen vs windowed diff = %.5f\n", diff);
+                    check(diff < 0.001,
+                          "offscreen frame matches the windowed render (pixel diff small)");
+                }
+
+                pulp_embed_destroy(ov);
             }
         }
 
