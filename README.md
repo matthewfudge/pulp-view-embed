@@ -165,10 +165,23 @@ limitation.
 
 **Roadmap:** the source list above is already the importer's; new sources land
 in `pulp import-design` upstream and the embed picks them up for free (no embed
-change needed). Embed-specific roadmap items are Windows/Linux host parity
-(host code is in; Windows compile-verify pending), `pulp add`-style packaged
-distribution, and zero-copy GPU compositing (the offscreen path currently does
-a CPU RGBA readback).
+change needed). Embed-specific roadmap items:
+
+- **v2 — native vector knobs that match the source design.** The importer
+  recently gained a *faithful-vector* render mode (Plan B: pulp #3465
+  `DesignFrameView`, #3466 typed IR, #3469/#3470 REST + Figma-plugin emit
+  faithful-vector frames, #3309 synthesized SVG paths, #3436/#3444 native knob
+  fidelity, #3460/#3453 baked-indicator cleanup). Wiring the embed's DesignIR
+  path to that mode gives **native (no-JS) vector knobs** that match the
+  original, instead of today's choice between the JS bundle (high-fi but carries
+  the JS runtime) and the flat `build_native_view_tree` fallback (drops detail).
+- **v2 — interactive controls (search boxes, selects, dropdowns).** The importer
+  now emits real interactive fields (pulp #3451: search-box field + dropdown
+  precision + control positioning). Surface those through the embed + the ABI v3
+  input/param bridge so they behave like they do in the Pulp import preview.
+- Windows/Linux host parity (host code is in; Windows compile-verify pending).
+- `pulp add`-style packaged distribution.
+- Zero-copy GPU compositing (the offscreen path currently does a CPU RGBA readback).
 
 ## What works (v1, macOS)
 
