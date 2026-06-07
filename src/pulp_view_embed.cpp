@@ -253,6 +253,10 @@ private:
             "    var __sks = setKnobSpriteStrip;\n"
             "    setKnobSpriteStrip = function(id, p, n, o){ return __sks(id, __pulpEmbedResolve(p), n, o); };\n"
             "  }\n"
+            "  if (typeof registerFont === 'function'){\n"
+            "    var __rf = registerFont;\n"
+            "    registerFont = function(fam, p){ return __rf(fam, __pulpEmbedResolve(p)); };\n"
+            "  }\n"
             "})();\n";
 
         const fs::path out = bundle_dir_ / ".pulp-embed-run.js";
