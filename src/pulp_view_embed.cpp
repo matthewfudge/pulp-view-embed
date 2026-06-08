@@ -1384,7 +1384,20 @@ PulpEmbedResult pulp_embed_simulate_param_drag(PulpEmbedView* v, int32_t index, 
         if (!w) return set_err(v, PULP_EMBED_ERR_INVALID_ARG, "param widget gone");
         const float tgt = static_cast<float>(target < 0.0 ? 0.0 : (target > 1.0 ? 1.0 : target));
 
-        if (b.kind == ParamWidgetKind::knob) {
+        if (b.frame_element_index >= 0) {
+            // Faithful-vector lane: `widget` is the DesignFrameView, not a
+            // Knob/Fader/Toggle, so the widget-cast paths below don't apply.
+            // Drive the SAME begin -> change -> end callbacks a real drag on the
+            // frame fires (wired in build_param_bridge), so UI->host forwarding
+            // and the visual both move. set_element_value updates the visual
+            // silently; on_element_changed drives the store -> host.set_param path.
+            auto* frame = static_cast<pulp::view::DesignFrameView*>(w);
+            const int el = b.frame_element_index;
+            if (frame->on_gesture_begin) frame->on_gesture_begin(el);
+            frame->set_element_value(el, tgt);
+            if (frame->on_element_changed) frame->on_element_changed(el, tgt);
+            if (frame->on_gesture_end) frame->on_gesture_end(el);
+        } else if (b.kind == ParamWidgetKind::knob) {
             // Knob drag is delta-based: down records start value at start_y;
             // drag up by (target-cur)*150 px reaches the target (widgets.cpp).
             auto* k = static_cast<pulp::view::Knob*>(w);
