@@ -120,6 +120,14 @@ if(PULP_VIEW_EMBED_SHARED)
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/pulp_view_embed)
 endif()
 
+# ── shim self-tests + harnesses ──────────────────────────────────────────────
+# Only when pulp-view-embed is built DIRECTLY (top-level). When an adapter repo
+# (pulp-embed-juce / -iplug2) pulls it in via add_subdirectory, these targets +
+# ctests must NOT register into the adapter's suite — the adapter tests the
+# adapter; the shim tests the shim. (Otherwise the adapter's ctest inherits
+# embed-smoke / embed-validate-faithful and reports them "Not Run".)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+
 # ── smoke harness (M1.1–M1.10) ───────────────────────────────────────────────
 # macOS-only AppKit host: create from a DesignIR fixture, attach to a real
 # NSView, resize, tick, capture, and stress create/destroy. Registered as a
@@ -165,3 +173,5 @@ add_test(NAME embed-validate-faithful
     COMMAND pulp-embed-validate
         "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/figma-vst-style-faithful/design.ir.json"
         --design-w 1000 --design-h 600)
+
+endif()  # top-level only (CMAKE_SOURCE_DIR == CMAKE_CURRENT_SOURCE_DIR)

@@ -28,6 +28,7 @@ _pulp_embed_native_handle
 _pulp_embed_notify_attached
 _pulp_embed_param_changed
 _pulp_embed_param_count
+_pulp_embed_param_info
 _pulp_embed_param_key
 _pulp_embed_param_value
 _pulp_embed_param_widget_id

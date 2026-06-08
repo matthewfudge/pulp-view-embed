@@ -106,6 +106,48 @@ public:
         return out;
     }
 
+    // Per-element metadata for the faithful lane (ABI v5 pulp_embed_param_info),
+    // derived from the IRInteractiveElement the materializer already carries — no
+    // pulp-core change needed. Index matches faithful_element_keys() / the
+    // DesignFrameView element order. Choice controls (dropdown/tab/stepper) are
+    // discrete; their default is selected_index normalized over the option span.
+    struct FaithfulMeta {
+        int element_index = -1;
+        const char* kind = "knob";
+        bool is_discrete = false;
+        int option_count = 0;
+        float default_norm = 0.5f;
+    };
+    std::vector<FaithfulMeta> faithful_element_metas() const {
+        std::vector<FaithfulMeta> out;
+        const pulp::view::IRNode* frame = find_faithful_node(ir_.root);
+        if (!frame) return out;
+        using K = pulp::view::InteractiveElementKind;
+        for (int i = 0; i < static_cast<int>(frame->interactive_elements.size()); ++i) {
+            const auto& e = frame->interactive_elements[static_cast<size_t>(i)];
+            if (e.kind == K::text_field) continue;  // skipped in keys() too
+            FaithfulMeta m;
+            m.element_index = i;
+            switch (e.kind) {
+                case K::knob:      m.kind = "knob";      m.is_discrete = false; break;
+                case K::dropdown:  m.kind = "dropdown";  m.is_discrete = true;  break;
+                case K::tab_group: m.kind = "tab_group"; m.is_discrete = true;  break;
+                case K::stepper:   m.kind = "stepper";   m.is_discrete = true;  break;
+                default:           m.kind = "knob";      m.is_discrete = false; break;
+            }
+            if (m.is_discrete) {
+                m.option_count = static_cast<int>(e.options.size());
+                const int span = m.option_count > 1 ? m.option_count - 1 : 1;
+                m.default_norm = static_cast<float>(e.selected_index) / static_cast<float>(span);
+            } else {
+                m.option_count = 0;
+                m.default_norm = e.default_value;
+            }
+            out.push_back(m);
+        }
+        return out;
+    }
+
 private:
     static const pulp::view::IRNode* find_faithful_node(const pulp::view::IRNode& n) {
         if (n.render_mode == pulp::view::NodeRenderMode::faithful_svg) return &n;
@@ -368,6 +410,16 @@ struct ParamBinding {
     // (wired in build_param_bridge); set_element_value is silent so host pushes
     // don't echo back.
     int   frame_element_index = -1;
+
+    // Richer metadata (ABI v5, pulp_embed_param_info). widget_kind is the design
+    // control's real kind ("knob"/"fader"/"toggle"/"dropdown"/"tab_group"/
+    // "stepper"); choice controls are discrete with option_count options.
+    // default_norm is the imported default [0,1]. name/unit/range stay unset
+    // until the importer carries them (a later pulp-core slice).
+    std::string widget_kind = "knob";
+    bool        is_discrete = false;
+    int         option_count = 0;
+    float       default_norm = 0.0f;
 };
 
 }  // namespace
@@ -740,6 +792,15 @@ void collect_bindable(pulp::view::View* v, std::vector<ParamBinding>& out) {
         b.key = v->id();        // default key == widget id (no metadata in ui.js)
         b.kind = kind;
         b.widget = v;
+        // Native-widget metadata (ABI v5): a toggle is a 2-option discrete; knob/
+        // fader are continuous. default_norm is filled from the widget's seeded
+        // value in the bind loop below.
+        switch (kind) {
+            case ParamWidgetKind::knob:   b.widget_kind = "knob";   break;
+            case ParamWidgetKind::fader:  b.widget_kind = "fader";  break;
+            case ParamWidgetKind::toggle:
+                b.widget_kind = "toggle"; b.is_discrete = true; b.option_count = 2; break;
+        }
         out.push_back(std::move(b));
     }
     for (size_t i = 0; i < v->child_count(); ++i)
@@ -827,13 +888,23 @@ void build_param_bridge(PulpEmbedView* v) {
     // normalized param — skipped, still in-view interactive.)
     if (auto* ep = dynamic_cast<EmbedProcessor*>(v->processor.get())) {
         if (auto* frame = find_design_frame_view(root)) {
-            for (auto& [idx, key] : ep->faithful_element_keys()) {
+            const auto keys = ep->faithful_element_keys();
+            const auto metas = ep->faithful_element_metas();  // same order/size
+            for (size_t k = 0; k < keys.size(); ++k) {
                 ParamBinding b;
-                b.key = key;
-                b.widget_id = key;
+                b.key = keys[k].second;
+                b.widget_id = keys[k].second;
                 b.kind = ParamWidgetKind::knob;  // value carried via frame element
                 b.widget = frame;
-                b.frame_element_index = idx;
+                b.frame_element_index = keys[k].first;
+                // ABI v5 metadata from the IRInteractiveElement (kind/discrete/
+                // option_count/default) — choice controls keep their real kind.
+                if (k < metas.size()) {
+                    b.widget_kind = metas[k].kind;
+                    b.is_discrete = metas[k].is_discrete;
+                    b.option_count = metas[k].option_count;
+                    b.default_norm = metas[k].default_norm;
+                }
                 v->params.push_back(std::move(b));
             }
         }
@@ -859,6 +930,10 @@ void build_param_bridge(PulpEmbedView* v) {
         // Seed: prefer the host's current value (automation/preset already set
         // before the editor opened), else the widget's imported default.
         float seed = widget_normalized(b);
+        // Record the imported default (pre-host) for ABI v5 param_info. Faithful
+        // elements already carry it from the IRInteractiveElement metadata.
+        if (b.frame_element_index < 0)
+            b.default_norm = seed;
         if (v->host_cb.get_param) {
             double hv = v->host_cb.get_param(v->host_ctx, b.key.c_str());
             if (hv >= 0.0 && hv <= 1.0) {
@@ -1373,6 +1448,33 @@ double pulp_embed_param_value(PulpEmbedView* v, int32_t index) {
         return -1.0;
     return static_cast<double>(
         v->store->get_normalized(v->params[static_cast<size_t>(index)].param_id));
+}
+
+PulpEmbedResult pulp_embed_param_info(PulpEmbedView* v, int32_t index,
+                                      PulpEmbedParamInfo* out) {
+    if (out) *out = PulpEmbedParamInfo{};  // zero-fill so partial reads are safe
+    if (!v || !out || index < 0 || static_cast<size_t>(index) >= v->params.size())
+        return PULP_EMBED_ERR_INVALID_ARG;
+    const auto& b = v->params[static_cast<size_t>(index)];
+    auto copy = [](char* dst, size_t cap, const std::string& s) {
+        const size_t n = s.size() < cap - 1 ? s.size() : cap - 1;
+        std::memcpy(dst, s.data(), n);
+        dst[n] = '\0';
+    };
+    copy(out->widget_kind, sizeof out->widget_kind, b.widget_kind);
+    out->is_discrete = b.is_discrete ? 1 : 0;
+    out->option_count = b.option_count;
+    out->default_norm = static_cast<double>(b.default_norm);
+    // name/unit/range come from the importer in a later slice; not yet carried.
+    out->name[0] = '\0';
+    out->unit[0] = '\0';
+    out->has_range = 0;
+    out->min_value = 0.0;
+    out->max_value = 0.0;
+    // step_count: a discrete control's option count is its step count.
+    out->step_count = b.is_discrete ? b.option_count : 0;
+    out->has_meta = 0;
+    return PULP_EMBED_OK;
 }
 
 PulpEmbedResult pulp_embed_simulate_param_drag(PulpEmbedView* v, int32_t index, double target) {

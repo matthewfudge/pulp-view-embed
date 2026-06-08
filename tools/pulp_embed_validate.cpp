@@ -208,6 +208,28 @@ int main(int argc, char** argv) {
         info("(pass --host-keys to report bound vs visual-only controls)");
     }
 
+    // Per-control metadata (ABI v5) — what a host needs to BUILD a correct param
+    // from the design (greenfield) or VERIFY its own. Reported, not gated.
+    {
+        int discrete = 0, continuous = 0;
+        for (int i = 0; i < n; ++i) {
+            PulpEmbedParamInfo pi{};
+            if (pulp_embed_param_info(v, i, &pi) != PULP_EMBED_OK) continue;
+            char key[256] = {0};
+            pulp_embed_param_key(v, i, key, sizeof key);
+            (pi.is_discrete ? ++discrete : ++continuous);
+            char line[420];
+            std::snprintf(line, sizeof line,
+                "  %-22s kind=%-9s %s default=%.3f%s%s", key, pi.widget_kind,
+                pi.is_discrete ? "discrete" : "continuous", pi.default_norm,
+                pi.option_count ? (std::string(" options=") + std::to_string(pi.option_count)).c_str() : "",
+                pi.has_meta ? (std::string(" name=\"") + pi.name + "\" unit=\"" + pi.unit + "\"").c_str() : "");
+            info(line);
+        }
+        info("param metadata: " + std::to_string(continuous) + " continuous, " +
+             std::to_string(discrete) + " discrete");
+    }
+
     // ── 3) asset resolution (the placeholder-render trap) ───────────────────
     // Check the assets the RENDER actually consumes, not every manifest entry.
     // DesignIR: faithful frames render `svg_asset_id`; fonts reference an

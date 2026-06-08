@@ -56,7 +56,15 @@ extern "C" {
  *       frame). These are new functions, not desc-layout changes.
  * The desc layout grows (host block gains resolve_resource), so this is a real
  * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
-#define PULP_VIEW_EMBED_ABI_VERSION 4u
+#define PULP_VIEW_EMBED_ABI_VERSION 5u
+
+/* v5 (2026-06): richer parameter metadata. Adds PulpEmbedParamInfo +
+ * pulp_embed_param_info() so a host can build a correct param from the design
+ * (greenfield) or verify its own (existing plugin): control kind, discreteness,
+ * option count, and imported default are available now from the materialized
+ * design; name/unit/range fields are present but only populated once the
+ * importer carries them (has_range == 0 until then). New function only — no desc
+ * layout change — so v1..v4 callers are unaffected. */
 
 /* Opaque embedded-view handle. */
 typedef struct PulpEmbedView PulpEmbedView;
@@ -394,6 +402,45 @@ size_t pulp_embed_param_widget_id(PulpEmbedView* view, int32_t index, char* buf,
 /* Current NORMALIZED [0,1] value of the parameter at `index`, or a negative
  * value for an out-of-range index / NULL view. */
 double pulp_embed_param_value(PulpEmbedView* view, int32_t index);
+
+/* Richer parameter metadata (ABI v5) for the bindable control at `index`.
+ *
+ * Lets a host BUILD a correct host parameter from the design (greenfield/template
+ * plugins) or VERIFY its own against the design (existing plugins — the binding
+ * model keeps the plugin's params authoritative; this is advisory there). Fields:
+ *   widget_kind   "knob" | "fader" | "toggle" | "dropdown" | "tab_group" |
+ *                 "stepper" (the design control's real kind; NUL-terminated).
+ *   is_discrete   1 for stepped/choice/toggle controls, 0 for continuous.
+ *   option_count  number of discrete options for a choice control (dropdown /
+ *                 tab_group / stepper), else 0. For a toggle, 2.
+ *   default_norm  the imported default value, NORMALIZED [0,1].
+ *   name, unit    display name / unit ("dB","Hz","%"). EMPTY until the importer
+ *                 carries them; gate on has_meta, do not assume populated.
+ *   has_range     1 iff min_value/max_value/step_count are meaningful (real
+ *                 units imported); 0 = normalized-only (use [0,1]).
+ *   min_value,
+ *   max_value     denormalized range when has_range; else 0.
+ *   step_count    discrete step count when known (0 = continuous / unknown).
+ *   has_meta      1 iff name/unit were imported (so "" means "unset", not blank).
+ *
+ * Returns PULP_EMBED_OK and fills *out, or PULP_EMBED_ERR_INVALID_ARG for a NULL
+ * view/out or out-of-range index (and zero-fills *out). */
+typedef struct PulpEmbedParamInfo {
+    char    widget_kind[16];
+    int32_t is_discrete;
+    int32_t option_count;
+    double  default_norm;
+    char    name[64];
+    char    unit[16];
+    int32_t has_range;
+    double  min_value;
+    double  max_value;
+    int32_t step_count;
+    int32_t has_meta;
+} PulpEmbedParamInfo;
+
+PulpEmbedResult pulp_embed_param_info(PulpEmbedView* view, int32_t index,
+                                      PulpEmbedParamInfo* out);
 
 /* Host -> view: push a NORMALIZED [0,1] value for the parameter identified by
  * `key` (host automation, preset recall, get_param sync). Updates the embed's
