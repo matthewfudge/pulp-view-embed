@@ -41,11 +41,25 @@ linking Pulp's C++ ABI.
 - Smoke gates M1.1–M1.11 (create/attach/teardown stress, hi-fi bundle, param
   bridge, resolve_resource, offscreen, and a resize/scale/DPI stress sweep).
 
+**Platforms:** macOS (primary) and **Linux/X11 (proven 2026-06-08)**. On Linux the
+Pulp SDK builds + `cmake --install`s, `pulp-view-embed` builds against it, the
+preflight renders headless, the iPlug2 adapter's tests pass, and the **live X11
+host attaches into a real X11 window and renders GPU-backed** (Dawn → Vulkan
+surface from the X11 window; software Vulkan under Xvfb). See `examples/
+linux-x11-smoke`. **Windows is blocked** on a prebuilt Windows Skia archive (Pulp
+builds GPU-OFF on Windows until one exists; the embed needs Skia).
+
 **Known limitations:**
 
-- macOS only today (the GPU host and the offscreen RGBA producer are
-  macOS-specific; Windows/Linux need a `PluginViewHost` factory + raw-pixel
-  producer).
+- **Linux SDK consumers need ICU + fontconfig at link** (system ICU, and
+  `-lfontconfig` *after* libskia.a). The installed `PulpConfig` re-finds ICU and
+  exposes `pulp_link_fontconfig_after_skia()`; call it on each Skia-linking exe on
+  Linux (the examples/adapters do). macOS needs neither.
+- The Linux X11 host opens its own connection to the same `$DISPLAY` — fine for
+  same-server hosts (the common case); host-supplied `Display*` (cross-Display) is
+  a follow-up seam.
+- Requires an installed Pulp SDK on `CMAKE_PREFIX_PATH` (the static build cannot
+  stand alone; the shared-lib dist is the foreign-host path).
 - Requires an installed Pulp SDK on `CMAKE_PREFIX_PATH` (the static build cannot
   stand alone; the shared-lib dist is the foreign-host path).
 - `pulp_embed_resize`'s `scale` is validated but advisory for the windowed embed
@@ -61,8 +75,9 @@ linking Pulp's C++ ABI.
   `AudioProcessorParameter` and iPlug2 `IParam` (the host maps its own
   parameters onto the design's keys once at create time).
 
-**Roadmap:** Windows/Linux `PluginViewHost`; zero-copy GPU compositing;
-`pulp add` foreign-host packaging integration.
+**Roadmap:** Linux is proven (above) — next a prebuilt Linux SDK tarball +
+`pulp add` foreign-host packaging; Windows once a prebuilt Windows Skia archive
+exists; zero-copy GPU compositing (watchlist — no consumer yet).
 
 ## Why
 
@@ -153,8 +168,9 @@ Notes:
   save. `enableBundleHotReload(bool)` forces it.
 
 **Longer-horizon (need a toolchain / infra / bigger design, not quick niceties):**
-- Windows/Linux host **compile-verify** — the HWND/X11 `PluginViewHost` code is
-  in; verifying needs a Windows+Skia (and Linux+Skia) toolchain.
+- Linux/X11 host — **verified** (SDK + embed + adapter build, headless render +
+  live X11 attach with GPU/Vulkan; see `examples/linux-x11-smoke`). Windows host —
+  blocked on a prebuilt Windows Skia archive (Pulp builds GPU-OFF on Windows).
 - `pulp add`-style packaged distribution — needs the core package-registry infra.
 - Zero-copy GPU compositing — the offscreen path currently does a CPU RGBA
   readback; eliminating it is a render-pipeline change.
@@ -248,7 +264,8 @@ change needed). Embed-specific roadmap items:
   now emits real interactive fields (pulp #3451: search-box field + dropdown
   precision + control positioning). Surface those through the embed + the ABI v3
   input/param bridge so they behave like they do in the Pulp import preview.
-- Windows/Linux host parity (host code is in; Windows compile-verify pending).
+- Linux/X11 host parity — verified (build + headless render + live X11 attach);
+  Windows blocked on a prebuilt Windows Skia archive.
 - `pulp add`-style packaged distribution.
 - Zero-copy GPU compositing (the offscreen path currently does a CPU RGBA readback).
 
