@@ -56,7 +56,15 @@ extern "C" {
  *       frame). These are new functions, not desc-layout changes.
  * The desc layout grows (host block gains resolve_resource), so this is a real
  * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
-#define PULP_VIEW_EMBED_ABI_VERSION 6u
+#define PULP_VIEW_EMBED_ABI_VERSION 7u
+
+/* v7 (2026-06): missing-asset diagnostics. Adds pulp_embed_missing_asset_count()
+ * + pulp_embed_missing_asset() so a host preflight can ask the materialized view
+ * which faithful-vector frame assets failed to resolve on disk, instead of
+ * re-parsing the DesignIR JSON + asset manifest by hand. The shim already walks
+ * the manifest at create; this just exposes the result. NO desc-layout change and
+ * NO new host callbacks — these are pure additive query functions, so v6 callers
+ * keep working unchanged (the version bump is informational/monotonic). */
 
 /* v6 (2026-06): text-field string bridge. A design's text_field controls are NOT
  * normalized params, so they ride a separate STRING side-channel: two callbacks
@@ -548,6 +556,22 @@ PulpEmbedResult pulp_embed_render_png(PulpEmbedView* view, int32_t width,
                                       uint8_t* out, size_t cap, size_t* out_len);
 
 /* ---- diagnostics ------------------------------------------------------ */
+
+/* Missing-asset query (ABI v7). At create time the shim walks the DesignIR asset
+ * manifest for the faithful-vector lane and records every frame asset (svg) whose
+ * resolved local_path is absent on disk. A host preflight uses this to fail fast
+ * with the offending paths, instead of re-parsing the JSON + manifest itself.
+ * Only the faithful frame svg refs are flagged; non-faithful fallback rasters the
+ * render never loads are intentionally NOT reported (no false positives). Bundle
+ * (scripted) views resolve assets through the session, so this is always 0 there. */
+
+/* Number of missing render assets recorded for this view (0 if none / NULL). */
+int32_t pulp_embed_missing_asset_count(PulpEmbedView* view);
+
+/* Copy the missing asset path at `index` into buf (NUL-terminated, truncated to
+ * cap). Returns the full length excluding the NUL, or 0 for an out-of-range
+ * index / NULL view. */
+size_t pulp_embed_missing_asset(PulpEmbedView* view, int32_t index, char* buf, size_t cap);
 
 /* Copy the handle's last error message into buf (NUL-terminated, truncated to
  * cap). Returns the full length excluding the NUL. view may be NULL (returns 0). */

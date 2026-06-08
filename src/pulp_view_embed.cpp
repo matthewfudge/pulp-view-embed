@@ -167,6 +167,10 @@ public:
         return out;
     }
 
+    // The parsed DesignIR (asset local_paths already rewritten to absolute by
+    // resolve_asset_paths) — for the missing-render-asset query (ABI v7).
+    const pulp::view::DesignIR& ir() const { return ir_; }
+
 private:
     static const pulp::view::IRNode* find_faithful_node(const pulp::view::IRNode& n) {
         if (n.render_mode == pulp::view::NodeRenderMode::faithful_svg) return &n;
@@ -483,6 +487,12 @@ struct PulpEmbedView {
     std::vector<StringBinding> strings;
     bool applying_host_string = false;
 
+    // ── missing render-asset diagnostics (ABI v7) ──
+    // Render-referenced assets (faithful svg_asset_id) that don't exist on disk
+    // after asset-path resolution. Computed once at create; an authoritative
+    // replacement for a consumer string-scanning the DesignIR JSON itself.
+    std::vector<std::string> missing_assets;
+
     // Thread that created the view. pulp_embed_reload_bundle (which rebuilds views
     // + touches the GPU surface) must run here; a call from another thread is
     // rejected with PULP_EMBED_ERR_WRONG_THREAD. Captured at construction.
@@ -533,6 +543,7 @@ void capture_host_callbacks(PulpEmbedView* v, const PulpEmbedDesc* desc) {
 // (next to the host/session wiring) but the create paths above reference them.
 void build_param_bridge(PulpEmbedView* v);
 void build_string_bridge(PulpEmbedView* v);
+void collect_missing_render_assets(PulpEmbedView* v);
 void poll_host_meters(PulpEmbedView* v);
 
 // ── host resource staging (resolve_resource, ABI v3) ───────────────────────
@@ -726,6 +737,11 @@ PulpEmbedResult create_from_json(const PulpEmbedDesc* desc,
     // Interactive parameter bridge (ABI v2): also available on the native
     // DesignIR tree path (Knob/Fader/Toggle widgets carry their node ids).
     build_param_bridge(v.get());
+
+    // Missing-asset diagnostics (ABI v7): walk the DesignIR asset manifest and
+    // record any svg/image whose resolved local_path is absent on disk, so the
+    // host preflight can query it authoritatively instead of re-parsing JSON.
+    collect_missing_render_assets(v.get());
 
     if (!offscreen && desc->design_width > 0 && desc->design_height > 0) {
         v->host->set_design_viewport(static_cast<float>(desc->design_width),
@@ -1082,6 +1098,36 @@ void build_string_bridge(PulpEmbedView* v) {
         };
         v->strings.push_back({key, te});
     }
+}
+
+// Compute render-referenced assets that are missing on disk (ABI v7). Uses the
+// parsed DesignIR + IRAssetManifest directly — authoritative, struct-based — so a
+// consumer (e.g. pulp-embed-validate) doesn't string-scan the JSON. Today it
+// covers the faithful-vector lane's frame SVG (svg_asset_id); the manifest's
+// other entries are non-faithful fallback rasters the render never loads, so they
+// are intentionally NOT flagged (avoids the false positive). local_paths were
+// rewritten to absolute by resolve_asset_paths, so existence is a direct check.
+// Bundle (scripted) views resolve assets through the session, not here -> empty.
+void collect_svg_refs(const pulp::view::IRNode& n,
+                      const pulp::view::IRAssetManifest& manifest,
+                      PulpEmbedView* v) {
+    namespace fs = std::filesystem;
+    if (n.svg_asset_id) {
+        if (const auto* a = manifest.resolve(*n.svg_asset_id)) {
+            std::error_code ec;
+            if (a->local_path && !a->local_path->empty() && !fs::exists(*a->local_path, ec))
+                v->missing_assets.push_back(*a->local_path);
+        }
+    }
+    for (const auto& c : n.children) collect_svg_refs(c, manifest, v);
+}
+
+void collect_missing_render_assets(PulpEmbedView* v) {
+    v->missing_assets.clear();
+    auto* ep = dynamic_cast<EmbedProcessor*>(v->processor.get());
+    if (!ep) return;  // DesignIR lane only; bundle assets load via the scripted session
+    const auto& ir = ep->ir();
+    collect_svg_refs(ir.root, ir.asset_manifest, v);
 }
 
 // Poll host meters once (called from tick). Designs without meter widgets and
@@ -1740,6 +1786,19 @@ PulpEmbedResult pulp_embed_render_png(PulpEmbedView* v, int32_t w, int32_t h,
     } catch (...) {
         return set_err(v, PULP_EMBED_ERR_INTERNAL, "render_png threw");
     }
+}
+
+int32_t pulp_embed_missing_asset_count(PulpEmbedView* v) {
+    if (!v) return 0;
+    return static_cast<int32_t>(v->missing_assets.size());
+}
+
+size_t pulp_embed_missing_asset(PulpEmbedView* v, int32_t index, char* buf, size_t cap) {
+    if (!v || index < 0 || static_cast<size_t>(index) >= v->missing_assets.size()) {
+        if (buf && cap > 0) buf[0] = '\0';
+        return 0;
+    }
+    return copy_str(v->missing_assets[static_cast<size_t>(index)], buf, cap);
 }
 
 size_t pulp_embed_last_error(PulpEmbedView* v, char* buf, size_t cap) {

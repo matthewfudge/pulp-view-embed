@@ -79,6 +79,7 @@ if(PULP_VIEW_EMBED_SHARED)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     install(FILES include/pulp_view_embed.h
+                  include/pulp_view_embed.hpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
     # Bundle the one non-system runtime dependency (the WebGPU backend dylib)

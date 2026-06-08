@@ -24,6 +24,8 @@ _pulp_embed_destroy
 _pulp_embed_detach
 _pulp_embed_last_create_error
 _pulp_embed_last_error
+_pulp_embed_missing_asset
+_pulp_embed_missing_asset_count
 _pulp_embed_native_handle
 _pulp_embed_notify_attached
 _pulp_embed_param_changed
