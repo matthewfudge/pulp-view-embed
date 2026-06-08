@@ -66,6 +66,34 @@ if(PULP_VIEW_EMBED_SHARED AND APPLE)
         # Find the bundled libwgpu_native.dylib next to us at runtime.
         BUILD_WITH_INSTALL_RPATH OFF
         INSTALL_RPATH "@loader_path")
+elseif(PULP_VIEW_EMBED_SHARED AND UNIX AND NOT ANDROID)
+    # Linux analog of the macOS .exp: a version script that exports only the
+    # pulp_embed_* C ABI and makes everything else (incl. symbols pulled from the
+    # static Pulp/Skia/Abseil/WebP archives) local. This is the load-bearing part
+    # and mirrors the macOS allowlist exactly — the .exp is the sole exported-
+    # symbol gate there, with no -fvisibility=hidden, and the same holds here.
+    # (NB: -fvisibility=hidden on the embed TU would HIDE the pulp_embed_* defs
+    # before the script's `global:` could export them — they carry no default-
+    # visibility attribute — yielding an empty export table. Don't add it without
+    # also annotating every public function PULP_EMBED_API; the version script
+    # alone already localizes the archive symbols, so it's unnecessary.)
+    # $ORIGIN rpath mirrors @loader_path so a relocatable tarball finds its deps.
+    set(_embed_map "${CMAKE_CURRENT_SOURCE_DIR}/src/pulp_view_embed.map")
+    target_link_options(pulp_view_embed PRIVATE
+        "-Wl,--version-script=${_embed_map}")
+    set_property(TARGET pulp_view_embed APPEND
+        PROPERTY LINK_DEPENDS "${_embed_map}")
+    set_target_properties(pulp_view_embed PROPERTIES
+        BUILD_WITH_INSTALL_RPATH OFF
+        INSTALL_RPATH "$ORIGIN")
+    # Make the .so self-contained: GNU ld's single pass needs -lfontconfig AFTER
+    # libskia.a, else dlopen fails on undefined FcDefaultSubstitute. The helper
+    # was already applied to the embed executables; the shared lib needs it too so
+    # a host can dlopen it without separately pulling fontconfig (mirrors the
+    # macOS dylib bundling its deps).
+    if(COMMAND pulp_link_fontconfig_after_skia)
+        pulp_link_fontconfig_after_skia(pulp_view_embed)
+    endif()
 endif()
 
 # ── Install / export (find_package(pulp_view_embed CONFIG)) ──────────────────
