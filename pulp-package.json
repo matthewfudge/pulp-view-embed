@@ -27,6 +27,13 @@
             "x86_64"
           ],
           "notes": "Source builds require an installed Pulp SDK discoverable via find_package(Pulp CONFIG REQUIRED) (set CMAKE_PREFIX_PATH). Prebuilt distributions ship a pulp_view_embedConfig.cmake so a foreign host can find_package(pulp_view_embed) without any Pulp build."
+        },
+        "Linux": {
+          "architectures": [
+            "arm64",
+            "x86_64"
+          ],
+          "notes": "Verified 2026-06-08 (X11). Same find_package(Pulp) flow as macOS; the installed Pulp SDK re-finds ICU and exposes pulp_link_fontconfig_after_skia() — call it on each Skia-linking exe (system ICU + fontconfig dev libs required). Headless render + live X11 host (Dawn Vulkan surface from the X11 window) both proven. A relocatable Linux SDK tarball is produced by tools/package-sdk.sh."
         }
       },
       "rt_safe": false,
