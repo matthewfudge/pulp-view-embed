@@ -104,6 +104,7 @@ public:
         bool is_discrete = false;
         int option_count = 0;
         float default_norm = 0.5f;
+        std::string label;  // §2.1 design caption (IRInteractiveElement.label); "" if none
     };
     // text_field elements (skipped by faithful_element_keys, which only covers
     // normalized params) — for the ABI v6 string bridge. (index, key) in frame
@@ -148,6 +149,7 @@ public:
                 m.option_count = 0;
                 m.default_norm = e.default_value;
             }
+            m.label = e.label;  // §2.1 caption -> generated-param name (empty if unnamed)
             out.push_back(m);
         }
         return out;

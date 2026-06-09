@@ -84,12 +84,15 @@ struct ParamBinding {
     // Richer metadata (ABI v5, pulp_embed_param_info). widget_kind is the design
     // control's real kind ("knob"/"fader"/"toggle"/"dropdown"/"tab_group"/
     // "stepper"); choice controls are discrete with option_count options.
-    // default_norm is the imported default [0,1]. name/unit/range stay unset
-    // until the importer carries them (a later pulp-core slice).
+    // default_norm is the imported default [0,1]. `name` is the design caption
+    // (§2.1: IRInteractiveElement.label) — empty until the importer carries it,
+    // in which case has_meta stays 0 and the host falls back to the key. unit/range
+    // remain a later slice.
     std::string widget_kind = "knob";
     bool        is_discrete = false;
     int         option_count = 0;
     float       default_norm = 0.0f;
+    std::string name;  // design caption (label); "" -> has_meta 0, fall back to key
 };
 
 }  // namespace
@@ -599,6 +602,7 @@ void build_param_bridge(PulpEmbedView* v) {
                     b.is_discrete = metas[k].is_discrete;
                     b.option_count = metas[k].option_count;
                     b.default_norm = metas[k].default_norm;
+                    b.name = metas[k].label;  // §2.1: design caption -> param name
                 }
                 v->params.push_back(std::move(b));
             }
@@ -1232,15 +1236,17 @@ PulpEmbedResult pulp_embed_param_info(PulpEmbedView* v, int32_t index,
     out->is_discrete = b.is_discrete ? 1 : 0;
     out->option_count = b.option_count;
     out->default_norm = static_cast<double>(b.default_norm);
-    // name/unit/range come from the importer in a later slice; not yet carried.
-    out->name[0] = '\0';
+    // §2.1: `name` is the design caption (IRInteractiveElement.label) when the
+    // importer carried one — has_meta then signals the host to prefer it over the
+    // key. unit/range remain a later slice (still uncarried).
+    copy(out->name, sizeof out->name, b.name);
     out->unit[0] = '\0';
     out->has_range = 0;
     out->min_value = 0.0;
     out->max_value = 0.0;
     // step_count: a discrete control's option count is its step count.
     out->step_count = b.is_discrete ? b.option_count : 0;
-    out->has_meta = 0;
+    out->has_meta = b.name.empty() ? 0 : 1;
     return PULP_EMBED_OK;
 }
 
