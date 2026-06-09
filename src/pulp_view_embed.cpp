@@ -18,6 +18,7 @@
 #include <pulp/state/parameter.hpp>
 #include <pulp/state/store.hpp>
 #include <pulp/view/design_frame_view.hpp>
+#include <pulp/view/text_editor.hpp>
 #include <pulp/view/design_import.hpp>
 #include <pulp/view/design_ir.hpp>
 #include <pulp/view/plugin_view_host.hpp>
@@ -26,6 +27,9 @@
 #include <pulp/view/theme.hpp>
 #include <pulp/view/view.hpp>
 #include <pulp/view/widgets.hpp>
+
+// The two Processor facades, split out for readability (private to this target).
+#include "embed_processors.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -47,345 +51,11 @@ namespace {
 // Thread-local detail for creation failures (no handle exists yet).
 thread_local std::string g_create_error;
 
-// Minimal inert processor: it exists only to satisfy ViewBridge's
-// (Processor&, StateStore&) contract and to hand the materialized DesignIR
-// view tree to the bridge via create_view(). No audio ever runs.
-class EmbedProcessor final : public pulp::format::Processor {
-public:
-    EmbedProcessor(pulp::view::DesignIR ir, pulp::format::ViewSize size)
-        : ir_(std::move(ir)), size_(size) {}
-
-    pulp::format::PluginDescriptor descriptor() const override {
-        pulp::format::PluginDescriptor d;
-        d.name = "PulpEmbed";
-        d.manufacturer = "Pulp";
-        d.bundle_id = "dev.pulp.embed";
-        d.version = "0.1.0";
-        return d;
-    }
-    void define_parameters(pulp::state::StateStore&) override {}
-    void prepare(const pulp::format::PrepareContext&) override {}
-    void process(pulp::audio::BufferView<float>&,
-                 const pulp::audio::BufferView<const float>&,
-                 pulp::midi::MidiBuffer&,
-                 pulp::midi::MidiBuffer&,
-                 const pulp::format::ProcessContext&) override {}
-
-    pulp::format::ViewSize view_size() const override { return size_; }
-
-    std::unique_ptr<pulp::view::View> create_view() override {
-        pulp::view::NativeMaterializeOptions opts;
-        return pulp::view::build_native_view_tree(ir_, ir_.asset_manifest, opts);
-    }
-
-    // Faithful-vector binding keys for every value-bearing element, in the same
-    // index order make_faithful_svg_frame builds them into the DesignFrameView,
-    // so element index i here maps to DesignFrameView element i. Key is the
-    // source node id (the importer's "binding key"); falls back to a stable
-    // synthetic key when the source carried none. Knobs are continuous; dropdown/
-    // tab_group/stepper are normalized-index choice params (DesignFrameView's
-    // uniform element_value/set_element_value handle both). text_field is text,
-    // not a normalized param, so it's skipped (still in-view interactive).
-    std::vector<std::pair<int, std::string>> faithful_element_keys() const {
-        std::vector<std::pair<int, std::string>> out;
-        const pulp::view::IRNode* frame = find_faithful_node(ir_.root);
-        if (!frame) return out;
-        using K = pulp::view::InteractiveElementKind;
-        for (int i = 0; i < static_cast<int>(frame->interactive_elements.size()); ++i) {
-            const auto& e = frame->interactive_elements[static_cast<size_t>(i)];
-            if (e.kind == K::text_field) continue;  // text is not a normalized param
-            std::string key = e.source_node_id.value_or("");
-            if (key.empty()) {
-                const char* p = e.kind == K::knob ? "knob"
-                              : e.kind == K::dropdown ? "dropdown"
-                              : e.kind == K::tab_group ? "tabs" : "stepper";
-                key = std::string(p) + ":" + std::to_string(i);
-            }
-            out.emplace_back(i, std::move(key));
-        }
-        return out;
-    }
-
-    // Per-element metadata for the faithful lane (ABI v5 pulp_embed_param_info),
-    // derived from the IRInteractiveElement the materializer already carries — no
-    // pulp-core change needed. Index matches faithful_element_keys() / the
-    // DesignFrameView element order. Choice controls (dropdown/tab/stepper) are
-    // discrete; their default is selected_index normalized over the option span.
-    struct FaithfulMeta {
-        int element_index = -1;
-        const char* kind = "knob";
-        bool is_discrete = false;
-        int option_count = 0;
-        float default_norm = 0.5f;
-    };
-    std::vector<FaithfulMeta> faithful_element_metas() const {
-        std::vector<FaithfulMeta> out;
-        const pulp::view::IRNode* frame = find_faithful_node(ir_.root);
-        if (!frame) return out;
-        using K = pulp::view::InteractiveElementKind;
-        for (int i = 0; i < static_cast<int>(frame->interactive_elements.size()); ++i) {
-            const auto& e = frame->interactive_elements[static_cast<size_t>(i)];
-            if (e.kind == K::text_field) continue;  // skipped in keys() too
-            FaithfulMeta m;
-            m.element_index = i;
-            switch (e.kind) {
-                case K::knob:      m.kind = "knob";      m.is_discrete = false; break;
-                case K::dropdown:  m.kind = "dropdown";  m.is_discrete = true;  break;
-                case K::tab_group: m.kind = "tab_group"; m.is_discrete = true;  break;
-                case K::stepper:   m.kind = "stepper";   m.is_discrete = true;  break;
-                default:           m.kind = "knob";      m.is_discrete = false; break;
-            }
-            if (m.is_discrete) {
-                m.option_count = static_cast<int>(e.options.size());
-                const int span = m.option_count > 1 ? m.option_count - 1 : 1;
-                m.default_norm = static_cast<float>(e.selected_index) / static_cast<float>(span);
-            } else {
-                m.option_count = 0;
-                m.default_norm = e.default_value;
-            }
-            out.push_back(m);
-        }
-        return out;
-    }
-
-private:
-    static const pulp::view::IRNode* find_faithful_node(const pulp::view::IRNode& n) {
-        if (n.render_mode == pulp::view::NodeRenderMode::faithful_svg) return &n;
-        for (const auto& c : n.children)
-            if (const auto* f = find_faithful_node(c)) return f;
-        return nullptr;
-    }
-
-    pulp::view::DesignIR ir_;
-    pulp::format::ViewSize size_;
-};
-
-// High-fidelity processor: renders an importer JS bundle (`ui.js`) through the
-// SAME scripted-UI pipeline (ScriptedUiSession + WidgetBridge) the Pulp
-// importer's own --validate render and real GPU-scripted plugins use. The
-// scripted path drives the native widget bridge (createCol/createImage/
-// createKnob + setImageSource) and composites the rasterized assets, so the
-// embed reproduces the importer render instead of the flattened native-widget
-// fallback that build_native_view_tree produces.
-//
-// Ownership/lifetime: this processor owns the root View and the
-// ScriptedUiSession (which holds `View&`). create_view() hands the root to the
-// ViewBridge by transferring the unique_ptr — the View object is unmoved, so
-// the session's reference stays valid. active_scripted_ui() lets ViewBridge
-// (and the shim's GPU-surface handoff) reach the session.
-class EmbedScriptedProcessor final : public pulp::format::Processor {
-public:
-    EmbedScriptedProcessor(std::filesystem::path script_path,
-                           std::filesystem::path bundle_dir,
-                           pulp::format::ViewSize size)
-        : script_path_(std::move(script_path)),
-          bundle_dir_(std::move(bundle_dir)),
-          size_(size) {}
-
-    ~EmbedScriptedProcessor() override {
-        // Drop the resolved-script temp file if we wrote one.
-        if (!effective_script_.empty() && effective_script_ != script_path_) {
-            std::error_code ec;
-            std::filesystem::remove(effective_script_, ec);
-        }
-    }
-
-    pulp::format::PluginDescriptor descriptor() const override {
-        pulp::format::PluginDescriptor d;
-        d.name = "PulpEmbed";
-        d.manufacturer = "Pulp";
-        d.bundle_id = "dev.pulp.embed";
-        d.version = "0.1.0";
-        return d;
-    }
-    void define_parameters(pulp::state::StateStore&) override {}
-    void prepare(const pulp::format::PrepareContext&) override {}
-    void process(pulp::audio::BufferView<float>&,
-                 const pulp::audio::BufferView<const float>&,
-                 pulp::midi::MidiBuffer&,
-                 pulp::midi::MidiBuffer&,
-                 const pulp::format::ProcessContext&) override {}
-
-    pulp::format::ViewSize view_size() const override { return size_; }
-
-    // Optional id -> absolute-staged-path overrides for host-served assets
-    // (resolve_resource). The JS path-resolver preamble checks this map FIRST
-    // (by the path as written in ui.js) and falls back to the bundle dir, so a
-    // host-served `assets/x.png` overrides the on-disk one. Set before
-    // load_or_throw().
-    void set_asset_overrides(std::vector<std::pair<std::string, std::string>> ov) {
-        asset_overrides_ = std::move(ov);
-    }
-
-    // Build the root + scripted session and load the bundle. Throws on load
-    // failure so the create path reports a precise error.
-    void load_or_throw() {
-        root_ = std::make_unique<pulp::view::View>();
-        root_->set_theme(pulp::view::Theme::dark());
-        root_->flex().direction = pulp::view::FlexDirection::column;
-        // Tag the root so the host auto-selects the GPU PluginViewHost — the
-        // scripted UI paints through the Skia/Dawn pipeline. Mirrors
-        // pulp::format::build_editor_ui().
-        root_->set_requires_gpu_host(true);
-        // Give the root the design bounds before the script runs so any
-        // position:absolute + inset:0 chain resolves against a real size
-        // (pulp #1899). The shim re-applies bounds before each render too.
-        root_->set_bounds({0.0f, 0.0f,
-                           static_cast<float>(size_.preferred_width),
-                           static_cast<float>(size_.preferred_height)});
-
-        // Portable bundles may reference assets by path relative to the bundle
-        // dir (e.g. `assets/foo.png`). setImageSource / setKnobSpriteStrip load
-        // a path verbatim (absolute, or relative to CWD), so without help a
-        // relative bundle would only render its images when run from the bundle
-        // dir. Prepend a tiny JS shim that resolves relative asset paths against
-        // the bundle dir before the original setters run. Absolute paths (the
-        // CLI's default `--emit js` output) pass through untouched, so this is a
-        // no-op for those. The combined script is written next to ui.js as a
-        // temp file and removed in the destructor.
-        // Dev hot-reload (opt-in, off by default = production-safe): set
-        // PULP_EMBED_HOT_RELOAD=1 to live-reload the bundle while a host editor
-        // is open. It reuses Pulp's ScriptedUiSession HotReloader (background
-        // choc::file::Watcher → UI-thread poll_reload() with widget-value
-        // preservation), which the embed already pumps via the host idle tick
-        // (wire_scripted_session_to_host). The watcher watches the script that
-        // is loaded, so in dev mode we load the ORIGINAL ui.js directly (the
-        // file the developer edits) rather than the temp asset-resolver wrapper
-        // — dev bundles should therefore use the importer's default absolute
-        // asset paths (a portabilized relative bundle resolves assets via the
-        // wrapper, which is the production path). See the README dev-loop guide.
-        const bool dev_hot_reload = std::getenv("PULP_EMBED_HOT_RELOAD") != nullptr;
-        effective_script_ = dev_hot_reload ? script_path_ : build_effective_script();
-
-        pulp::view::ScriptedUiOptions options;
-        options.script_path = effective_script_;
-        options.enable_hot_reload = dev_hot_reload;
-        options.enable_theme_reload = dev_hot_reload;
-        session_ = std::make_unique<pulp::view::ScriptedUiSession>(*root_, store_, std::move(options));
-
-        std::string err;
-        if (!session_->load(&err)) {
-            throw std::runtime_error("scripted UI load failed: " + (err.empty() ? "unknown" : err));
-        }
-    }
-
-    std::unique_ptr<pulp::view::View> create_view() override {
-        // ViewBridge::open() calls this once. Transfer the already-built root;
-        // the session keeps its View& valid (the object is not moved).
-        return std::move(root_);
-    }
-
-    pulp::view::ScriptedUiSession* active_scripted_ui() override { return session_.get(); }
-    const pulp::view::ScriptedUiSession* active_scripted_ui() const override { return session_.get(); }
-
-    // Reload the scripted UI in place (pulp_embed_reload_bundle). With an empty
-    // new_bundle_dir, reload the current bundle (picks up edits to its ui.js);
-    // otherwise switch to new_bundle_dir/ui.js. Regenerates the effective script
-    // the same way load_or_throw did (dev = the original ui.js; otherwise the
-    // asset-resolver-wrapped temp) and hands it to ScriptedUiSession::reload_from,
-    // which rebuilds under the same root + GPU surface, preserves widget state,
-    // and probes first (a bad reload keeps the last-good UI -> returns false).
-    bool reload(const std::filesystem::path& new_bundle_dir, std::string* error) {
-        if (!session_) { if (error) *error = "no scripted session to reload"; return false; }
-        if (!new_bundle_dir.empty()) {
-            bundle_dir_ = new_bundle_dir;
-            script_path_ = bundle_dir_ / "ui.js";
-        }
-        const bool dev = std::getenv("PULP_EMBED_HOT_RELOAD") != nullptr;
-        effective_script_ = dev ? script_path_ : build_effective_script();
-        return session_->reload_from(effective_script_, error);
-    }
-
-    // Destroy the scripted session (and its WidgetBridge) while the root View
-    // it references is still alive. MUST be called before the ViewBridge closes
-    // (which destroys the root) — the WidgetBridge destructor touches root_,
-    // so destroying it after the View is freed is a use-after-free. The shim's
-    // teardown calls this first; see pulp_embed_destroy().
-    void release_session() { session_.reset(); }
-
-private:
-    // Build the script the session actually loads. When bundle_dir_ is known we
-    // wrap ui.js with a path-resolving preamble so relative `assets/...` paths
-    // load regardless of CWD, written as a temp file beside ui.js. If no rewrite
-    // is needed (no bundle dir, or write fails) we fall back to script_path_.
-    std::filesystem::path build_effective_script() {
-        namespace fs = std::filesystem;
-        if (bundle_dir_.empty()) return script_path_;
-
-        std::ifstream in(script_path_, std::ios::binary);
-        if (!in) return script_path_;
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        const std::string ui = ss.str();
-
-        // JSON-string-escape helper for preamble literals.
-        auto esc_js = [](const std::string& s) {
-            std::string out;
-            out.reserve(s.size());
-            for (char c : s) {
-                if (c == '\\' || c == '"') out.push_back('\\');
-                out.push_back(c);
-            }
-            return out;
-        };
-
-        // Host-served asset overrides, as a JS object literal keyed by the path
-        // as written in ui.js -> the absolute staged path. Checked before the
-        // bundle-dir fallback so resolve_resource wins over disk.
-        std::string overrides_obj = "{";
-        for (size_t i = 0; i < asset_overrides_.size(); ++i) {
-            if (i) overrides_obj += ",";
-            overrides_obj += "\"" + esc_js(asset_overrides_[i].first) + "\":\"" +
-                             esc_js(asset_overrides_[i].second) + "\"";
-        }
-        overrides_obj += "}";
-
-        // The preamble wraps the two path-taking setters. A path is first looked
-        // up in the host-override map (resolve_resource); otherwise a path that
-        // is relative (no leading '/' and no 'scheme://') is prefixed with the
-        // bundle dir, and everything else is untouched.
-        std::string preamble =
-            "(function(){\n"
-            "  var __pulpEmbedBase = \"" + esc_js(bundle_dir_.string()) + "\";\n"
-            "  var __pulpEmbedOverrides = " + overrides_obj + ";\n"
-            "  function __pulpEmbedResolve(p){\n"
-            "    if (typeof p !== 'string' || p.length === 0) return p;\n"
-            "    if (Object.prototype.hasOwnProperty.call(__pulpEmbedOverrides, p))\n"
-            "      return __pulpEmbedOverrides[p];\n"
-            "    if (p.charAt(0) === '/' || /^[a-zA-Z]+:\\/\\//.test(p)) return p;\n"
-            "    return __pulpEmbedBase + '/' + p;\n"
-            "  }\n"
-            "  if (typeof setImageSource === 'function'){\n"
-            "    var __sis = setImageSource;\n"
-            "    setImageSource = function(id, p){ return __sis(id, __pulpEmbedResolve(p)); };\n"
-            "  }\n"
-            "  if (typeof setKnobSpriteStrip === 'function'){\n"
-            "    var __sks = setKnobSpriteStrip;\n"
-            "    setKnobSpriteStrip = function(id, p, n, o){ return __sks(id, __pulpEmbedResolve(p), n, o); };\n"
-            "  }\n"
-            "  if (typeof registerFont === 'function'){\n"
-            "    var __rf = registerFont;\n"
-            "    registerFont = function(fam, p){ return __rf(fam, __pulpEmbedResolve(p)); };\n"
-            "  }\n"
-            "})();\n";
-
-        const fs::path out = bundle_dir_ / ".pulp-embed-run.js";
-        std::ofstream of(out, std::ios::binary | std::ios::trunc);
-        if (!of) return script_path_;
-        of << preamble << ui;
-        of.close();
-        return out;
-    }
-
-    std::filesystem::path script_path_;
-    std::filesystem::path bundle_dir_;
-    std::filesystem::path effective_script_;
-    std::vector<std::pair<std::string, std::string>> asset_overrides_;
-    pulp::format::ViewSize size_;
-    pulp::state::StateStore store_;  // session needs a store for bindings
-    std::unique_ptr<pulp::view::View> root_;
-    std::unique_ptr<pulp::view::ScriptedUiSession> session_;
-};
+// The two Processor facades live in embed_processors.hpp (split out for
+// readability); pull them into this TU's unqualified scope so the create /
+// teardown / query paths below name them as before.
+using pulp::embed::shim::EmbedProcessor;
+using pulp::embed::shim::EmbedScriptedProcessor;
 
 // ── Parameter bridge ──────────────────────────────────────────────────────
 //
@@ -414,12 +84,15 @@ struct ParamBinding {
     // Richer metadata (ABI v5, pulp_embed_param_info). widget_kind is the design
     // control's real kind ("knob"/"fader"/"toggle"/"dropdown"/"tab_group"/
     // "stepper"); choice controls are discrete with option_count options.
-    // default_norm is the imported default [0,1]. name/unit/range stay unset
-    // until the importer carries them (a later pulp-core slice).
+    // default_norm is the imported default [0,1]. `name` is the design caption
+    // (§2.1: IRInteractiveElement.label) — empty until the importer carries it,
+    // in which case has_meta stays 0 and the host falls back to the key. unit/range
+    // remain a later slice.
     std::string widget_kind = "knob";
     bool        is_discrete = false;
     int         option_count = 0;
     float       default_norm = 0.0f;
+    std::string name;  // design caption (label); "" -> has_meta 0, fall back to key
 };
 
 }  // namespace
@@ -451,6 +124,24 @@ struct PulpEmbedView {
     // Guard: true while applying a HOST-driven change so the store listener does
     // not bounce the value back out to host.set_param (feedback-loop break).
     bool applying_host_change = false;
+
+    // ── text-field string bridge (ABI v6) ──
+    // One entry per bindable text_field; `widget` is the DesignFrameView's overlay
+    // TextEditor. key == the text_field's design key (source node id). Strings are
+    // host/plugin STATE (not automatable). applying_host_string guards set_text
+    // from echoing back to host.set_string.
+    struct StringBinding {
+        std::string key;
+        pulp::view::TextEditor* widget = nullptr;
+    };
+    std::vector<StringBinding> strings;
+    bool applying_host_string = false;
+
+    // ── missing render-asset diagnostics (ABI v7) ──
+    // Render-referenced assets (faithful svg_asset_id) that don't exist on disk
+    // after asset-path resolution. Computed once at create; an authoritative
+    // replacement for a consumer string-scanning the DesignIR JSON itself.
+    std::vector<std::string> missing_assets;
 
     // Thread that created the view. pulp_embed_reload_bundle (which rebuilds views
     // + touches the GPU surface) must run here; a call from another thread is
@@ -501,6 +192,8 @@ void capture_host_callbacks(PulpEmbedView* v, const PulpEmbedDesc* desc) {
 // Forward declarations — the param-bridge builders are defined further down
 // (next to the host/session wiring) but the create paths above reference them.
 void build_param_bridge(PulpEmbedView* v);
+void build_string_bridge(PulpEmbedView* v);
+void collect_missing_render_assets(PulpEmbedView* v);
 void poll_host_meters(PulpEmbedView* v);
 
 // ── host resource staging (resolve_resource, ABI v3) ───────────────────────
@@ -694,6 +387,11 @@ PulpEmbedResult create_from_json(const PulpEmbedDesc* desc,
     // Interactive parameter bridge (ABI v2): also available on the native
     // DesignIR tree path (Knob/Fader/Toggle widgets carry their node ids).
     build_param_bridge(v.get());
+
+    // Missing-asset diagnostics (ABI v7): walk the DesignIR asset manifest and
+    // record any svg/image whose resolved local_path is absent on disk, so the
+    // host preflight can query it authoritatively instead of re-parsing JSON.
+    collect_missing_render_assets(v.get());
 
     if (!offscreen && desc->design_width > 0 && desc->design_height > 0) {
         v->host->set_design_viewport(static_cast<float>(desc->design_width),
@@ -904,6 +602,7 @@ void build_param_bridge(PulpEmbedView* v) {
                     b.is_discrete = metas[k].is_discrete;
                     b.option_count = metas[k].option_count;
                     b.default_norm = metas[k].default_norm;
+                    b.name = metas[k].label;  // §2.1: design caption -> param name
                 }
                 v->params.push_back(std::move(b));
             }
@@ -1008,6 +707,78 @@ void build_param_bridge(PulpEmbedView* v) {
             if (auto pid = pid_for(idx)) self->store->end_gesture(pid);
         };
     }
+
+    // ABI v6: text_field string bridge (separate from the numeric params above).
+    build_string_bridge(v);
+}
+
+// Build the text-field string bridge (ABI v6): discover bindable text_field
+// overlay editors, seed each from host.get_string, and forward user edits to
+// host.set_string. Strings are host/plugin state, not normalized params.
+void build_string_bridge(PulpEmbedView* v) {
+    v->strings.clear();
+    if (!v || !v->bridge) return;
+    auto* root = v->bridge->view();
+    auto* ep = dynamic_cast<EmbedProcessor*>(v->processor.get());
+    if (!root || !ep) return;  // string bridge is the faithful-vector lane today
+    auto* frame = find_design_frame_view(root);
+    if (!frame) return;
+
+    for (auto& [idx, key] : ep->faithful_text_field_keys()) {
+        auto* te = dynamic_cast<pulp::view::TextEditor*>(frame->overlay_widget(idx));
+        if (!te) continue;
+        // Seed from host state (preset recall) before wiring the change hook.
+        if (v->host_cb.get_string) {
+            char buf[2048] = {0};
+            const int32_t n = v->host_cb.get_string(v->host_ctx, key.c_str(), buf,
+                                                     static_cast<int32_t>(sizeof buf));
+            if (n >= 0) {
+                buf[sizeof buf - 1] = '\0';
+                v->applying_host_string = true;
+                te->set_text(buf);
+                v->applying_host_string = false;
+            }
+        }
+        // User edit -> host (suppressed while we apply a host-driven set_text).
+        PulpEmbedView* self = v;
+        const std::string k = key;
+        te->on_change = [self, k](const std::string& text) {
+            if (self->applying_host_string) return;
+            if (self->host_cb.set_string)
+                self->host_cb.set_string(self->host_ctx, k.c_str(), text.c_str());
+        };
+        v->strings.push_back({key, te});
+    }
+}
+
+// Compute render-referenced assets that are missing on disk (ABI v7). Uses the
+// parsed DesignIR + IRAssetManifest directly — authoritative, struct-based — so a
+// consumer (e.g. pulp-embed-validate) doesn't string-scan the JSON. Today it
+// covers the faithful-vector lane's frame SVG (svg_asset_id); the manifest's
+// other entries are non-faithful fallback rasters the render never loads, so they
+// are intentionally NOT flagged (avoids the false positive). local_paths were
+// rewritten to absolute by resolve_asset_paths, so existence is a direct check.
+// Bundle (scripted) views resolve assets through the session, not here -> empty.
+void collect_svg_refs(const pulp::view::IRNode& n,
+                      const pulp::view::IRAssetManifest& manifest,
+                      PulpEmbedView* v) {
+    namespace fs = std::filesystem;
+    if (n.svg_asset_id) {
+        if (const auto* a = manifest.resolve(*n.svg_asset_id)) {
+            std::error_code ec;
+            if (a->local_path && !a->local_path->empty() && !fs::exists(*a->local_path, ec))
+                v->missing_assets.push_back(*a->local_path);
+        }
+    }
+    for (const auto& c : n.children) collect_svg_refs(c, manifest, v);
+}
+
+void collect_missing_render_assets(PulpEmbedView* v) {
+    v->missing_assets.clear();
+    auto* ep = dynamic_cast<EmbedProcessor*>(v->processor.get());
+    if (!ep) return;  // DesignIR lane only; bundle assets load via the scripted session
+    const auto& ir = ep->ir();
+    collect_svg_refs(ir.root, ir.asset_manifest, v);
 }
 
 // Poll host meters once (called from tick). Designs without meter widgets and
@@ -1465,15 +1236,17 @@ PulpEmbedResult pulp_embed_param_info(PulpEmbedView* v, int32_t index,
     out->is_discrete = b.is_discrete ? 1 : 0;
     out->option_count = b.option_count;
     out->default_norm = static_cast<double>(b.default_norm);
-    // name/unit/range come from the importer in a later slice; not yet carried.
-    out->name[0] = '\0';
+    // §2.1: `name` is the design caption (IRInteractiveElement.label) when the
+    // importer carried one — has_meta then signals the host to prefer it over the
+    // key. unit/range remain a later slice (still uncarried).
+    copy(out->name, sizeof out->name, b.name);
     out->unit[0] = '\0';
     out->has_range = 0;
     out->min_value = 0.0;
     out->max_value = 0.0;
     // step_count: a discrete control's option count is its step count.
     out->step_count = b.is_discrete ? b.option_count : 0;
-    out->has_meta = 0;
+    out->has_meta = b.name.empty() ? 0 : 1;
     return PULP_EMBED_OK;
 }
 
@@ -1563,6 +1336,114 @@ PulpEmbedResult pulp_embed_param_changed(PulpEmbedView* v, const char* key, doub
     }
 }
 
+// ── text-field string bridge (ABI v6) — reuses the file's copy_str() helper ──
+int32_t pulp_embed_string_param_count(PulpEmbedView* v) {
+    return v ? static_cast<int32_t>(v->strings.size()) : 0;
+}
+
+size_t pulp_embed_string_param_key(PulpEmbedView* v, int32_t index, char* buf, size_t cap) {
+    if (!v || index < 0 || static_cast<size_t>(index) >= v->strings.size()) {
+        if (buf && cap > 0) buf[0] = '\0';
+        return 0;
+    }
+    return copy_str(v->strings[static_cast<size_t>(index)].key, buf, cap);
+}
+
+size_t pulp_embed_get_string(PulpEmbedView* v, const char* key, char* buf, size_t cap) {
+    if (buf && cap > 0) buf[0] = '\0';
+    if (!v || !key) return 0;
+    for (const auto& s : v->strings)
+        if (s.key == key && s.widget) return copy_str(s.widget->text(), buf, cap);
+    return 0;
+}
+
+PulpEmbedResult pulp_embed_set_string(PulpEmbedView* v, const char* key, const char* utf8) {
+    if (!v || !key) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        for (auto& s : v->strings) {
+            if (s.key != key || !s.widget) continue;
+            // Apply without echoing back through TextEditor::on_change -> set_string.
+            v->applying_host_string = true;
+            s.widget->set_text(utf8 ? utf8 : "");
+            v->applying_host_string = false;
+            break;
+        }
+        return PULP_EMBED_OK;  // unknown key tolerated (blind-push), like param_changed
+    } catch (const std::exception& e) {
+        v->applying_host_string = false;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        v->applying_host_string = false;
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "set_string threw");
+    }
+}
+
+PulpEmbedResult pulp_embed_simulate_text_input(PulpEmbedView* v, int32_t index, const char* utf8) {
+    if (!v || index < 0 || static_cast<size_t>(index) >= v->strings.size())
+        return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto* te = v->strings[static_cast<size_t>(index)].widget;
+        if (!te) return set_err(v, PULP_EMBED_ERR_INVALID_ARG, "string widget gone");
+        // Real edit path (NOT guarded) — set_text fires on_change -> host.set_string,
+        // exactly as a user typing would.
+        te->set_text(utf8 ? utf8 : "");
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "simulate_text_input threw");
+    }
+}
+
+// Host -> view hover dispatch (no ABI bump — additive function).
+//
+// Embedded plugins host Pulp inside a JUCE/iPlug2/SDL component that owns
+// its platform mouse-move events; pulp-view-embed itself never sees those
+// events. Without forwarding, `View::set_hovered` is never called from any
+// non-test path → `on_hover_enter` (wired by registerHover) never fires →
+// JS `onMouseEnter` handlers stay silent. Host adapters override their own
+// mouseMove and forward (x,y) here in root-view coords; the shim defers to
+// `View::simulate_hover`, which performs the same hit-test + set_hovered
+// hop a native Pulp window does on real mouse moves.
+//
+// Symmetric with the existing pulp_embed_simulate_* family. Named
+// `dispatch_*` rather than `simulate_*` because the source IS a real
+// pointer, not a synthetic test event.
+PulpEmbedResult pulp_embed_dispatch_mouse_move(PulpEmbedView* v, double x, double y) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto* root = v->bridge->view();
+        if (!root) return PULP_EMBED_ERR_INVALID_ARG;
+        root->simulate_hover(pulp::view::Point{static_cast<float>(x),
+                                                static_cast<float>(y)});
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_move threw");
+    }
+}
+
+PulpEmbedResult pulp_embed_dispatch_mouse_exit(PulpEmbedView* v) {
+    if (!v || !v->bridge) return PULP_EMBED_ERR_INVALID_ARG;
+    try {
+        auto* root = v->bridge->view();
+        if (!root) return PULP_EMBED_ERR_INVALID_ARG;
+        // Pass an out-of-bounds point so hit_test returns null and any
+        // currently-hovered view clears (matches platform behaviour when
+        // the pointer leaves the window).
+        root->simulate_hover(pulp::view::Point{-1.0f, -1.0f});
+        if (v->host) v->host->repaint();
+        return PULP_EMBED_OK;
+    } catch (const std::exception& e) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, e.what());
+    } catch (...) {
+        return set_err(v, PULP_EMBED_ERR_INTERNAL, "dispatch_mouse_exit threw");
+    }
+}
+
 PulpEmbedResult pulp_embed_capture_png(PulpEmbedView* v, uint8_t* out,
                                        size_t cap, size_t* out_len) {
     if (!v || !v->host || !out_len) return PULP_EMBED_ERR_INVALID_ARG;
@@ -1606,6 +1487,19 @@ PulpEmbedResult pulp_embed_render_png(PulpEmbedView* v, int32_t w, int32_t h,
     } catch (...) {
         return set_err(v, PULP_EMBED_ERR_INTERNAL, "render_png threw");
     }
+}
+
+int32_t pulp_embed_missing_asset_count(PulpEmbedView* v) {
+    if (!v) return 0;
+    return static_cast<int32_t>(v->missing_assets.size());
+}
+
+size_t pulp_embed_missing_asset(PulpEmbedView* v, int32_t index, char* buf, size_t cap) {
+    if (!v || index < 0 || static_cast<size_t>(index) >= v->missing_assets.size()) {
+        if (buf && cap > 0) buf[0] = '\0';
+        return 0;
+    }
+    return copy_str(v->missing_assets[static_cast<size_t>(index)], buf, cap);
 }
 
 size_t pulp_embed_last_error(PulpEmbedView* v, char* buf, size_t cap) {

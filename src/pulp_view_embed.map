@@ -1,0 +1,24 @@
+# Version script for libpulp_view_embed.so (GNU ld / lld) — the Linux analog of
+# pulp_view_embed.exp (Mach-O / ld64).
+#
+# Without this, the static Pulp/Skia/Abseil/WebP archives linked into the .so
+# re-export tens of thousands of their own (and pulp::-mangled) symbols into the
+# foreign host's global symbol namespace, risking collisions. An anonymous
+# version with `local: *` makes EVERY symbol hidden EXCEPT the explicitly-global
+# pulp_embed_* C ABI — and, unlike -fvisibility=hidden, this also catches symbols
+# pulled from static archives that were compiled with default visibility.
+#
+# Unlike the Mach-O .exp, ELF symbol names carry NO leading underscore, so the
+# C function `pulp_embed_x` is just `pulp_embed_x` here. The wildcard keeps this
+# in lockstep with the C ABI automatically — every public function is named
+# pulp_embed_*, so no per-symbol maintenance is needed (cf. the .exp, which lists
+# each symbol explicitly because ld64 has no equivalent wildcard-export form).
+#
+# Wired via -Wl,--version-script. New public functions need no edit here as long
+# as they keep the pulp_embed_ prefix.
+{
+  global:
+    pulp_embed_*;
+  local:
+    *;
+};

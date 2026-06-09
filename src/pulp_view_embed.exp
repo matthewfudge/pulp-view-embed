@@ -24,6 +24,8 @@ _pulp_embed_destroy
 _pulp_embed_detach
 _pulp_embed_last_create_error
 _pulp_embed_last_error
+_pulp_embed_missing_asset
+_pulp_embed_missing_asset_count
 _pulp_embed_native_handle
 _pulp_embed_notify_attached
 _pulp_embed_param_changed
@@ -37,6 +39,13 @@ _pulp_embed_render_frame_rgba
 _pulp_embed_render_png
 _pulp_embed_repaint
 _pulp_embed_resize
+_pulp_embed_get_string
+_pulp_embed_set_string
 _pulp_embed_simulate_param_drag
+_pulp_embed_simulate_text_input
+_pulp_embed_dispatch_mouse_move
+_pulp_embed_dispatch_mouse_exit
 _pulp_embed_size_hints
+_pulp_embed_string_param_count
+_pulp_embed_string_param_key
 _pulp_embed_tick

@@ -176,6 +176,16 @@ absolute paths in `lib/cmake`, every shipped `.dylib` uses an `@rpath`/`@loader_
 install_name). The installed SDK is already relocatable because `PulpConfig.cmake`
 resolves paths via `CMAKE_CURRENT_LIST_DIR` / `PACKAGE_PREFIX_DIR`.
 
+> **Linux — verified (2026-06-08).** `package-sdk.sh` works on Linux too: it
+> produced a relocatable **78 MB** `pulp-sdk-linux-arm64` tarball (relocatability
+> check passed — no absolute paths, RPATH-relative `.so`s). End-to-end proof on the
+> local Linux Tart VM: untar to a *fresh* prefix, `find_package(Pulp)` against it,
+> build `pulp-view-embed` + run the preflight (non-blank render) — all green, no
+> Pulp source build. Linux consumers must have system **ICU + fontconfig** dev libs
+> (the SDK config re-finds ICU and exposes `pulp_link_fontconfig_after_skia`; call
+> it on each Skia-linking exe). Windows tarball is blocked on a prebuilt Windows
+> Skia archive (Pulp builds GPU-OFF on Windows).
+
 ### Consumer flow — untar + point `CMAKE_PREFIX_PATH`
 
 ```bash

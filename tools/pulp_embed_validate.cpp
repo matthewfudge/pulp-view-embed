@@ -50,10 +50,6 @@ bool file_exists(const std::string& p) {
     struct stat st {};
     return ::stat(p.c_str(), &st) == 0 && (st.st_mode & S_IFREG);
 }
-std::string dir_of(const std::string& path) {
-    const auto slash = path.find_last_of('/');
-    return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
-}
 std::string read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return {};
@@ -64,40 +60,6 @@ std::string read_file(const std::string& path) {
 bool looks_nonblank(const std::vector<uint8_t>& png, int w, int h) {
     if (png.size() < 8 || w <= 0 || h <= 0) return false;
     return static_cast<double>(png.size()) / (double(w) * double(h)) > 0.02;
-}
-
-// Read the string value immediately after a "<field>" token starting at/after
-// `from`; returns "" and leaves `from` past the field if none. (No JSON dep — a
-// scan good enough for an existence preflight.)
-std::string value_after(const std::string& json, const std::string& field, size_t& from) {
-    const std::string needle = "\"" + field + "\"";
-    size_t i = json.find(needle, from);
-    if (i == std::string::npos) { from = json.size(); return {}; }
-    i += needle.size();
-    while (i < json.size() && (json[i] == ' ' || json[i] == ':' || json[i] == '\t')) ++i;
-    from = i;
-    if (i >= json.size() || json[i] != '"') return {};
-    ++i;
-    std::string v;
-    while (i < json.size() && json[i] != '"') {
-        if (json[i] == '\\' && i + 1 < json.size()) ++i;  // skip escape
-        v += json[i++];
-    }
-    from = i;
-    return v;
-}
-
-// All "<field>": "<value>" strings in a blob. Order-preserving, deduped.
-std::vector<std::string> scan_string_field(const std::string& json, const std::string& field) {
-    std::vector<std::string> out;
-    std::set<std::string> seen;
-    size_t i = 0;
-    while (i < json.size()) {
-        const std::string v = value_after(json, field, i);
-        if (i >= json.size() && v.empty()) break;
-        if (!v.empty() && seen.insert(v).second) out.push_back(v);
-    }
-    return out;
 }
 
 std::vector<std::string> split_csv(const std::string& s) {
@@ -240,54 +202,21 @@ int main(int argc, char** argv) {
     {
         int missing = 0, checked = 0;
         if (!is_bundle) {
-            const std::string base = dir_of(src);
-            const std::string blob = read_file(src);
-
-            // manifest map: asset_id -> local_path (asset_id precedes local_path
-            // within each manifest object).
-            std::vector<std::pair<std::string, std::string>> manifest;  // id -> path
-            {
-                size_t i = 0;
-                while (i < blob.size()) {
-                    size_t at = i;
-                    const std::string id = value_after(blob, "asset_id", at);
-                    if (at >= blob.size() && id.empty()) break;
-                    size_t lp_at = at;
-                    const std::string lp = value_after(blob, "local_path", lp_at);
-                    if (!id.empty() && !lp.empty()) manifest.emplace_back(id, lp);
-                    i = at;  // advance past this asset_id (lp belongs to this object)
-                }
+            // Authoritative: the shim already walked the DesignIR asset manifest
+            // at create time and recorded exactly the faithful-frame svg refs
+            // whose resolved local_path is absent on disk (ABI v7). Querying it
+            // avoids re-implementing JSON + manifest parsing here and stays in
+            // lockstep with what the render actually consumes — the unreferenced
+            // fallback rasters are not flagged, so there is no false positive.
+            const int nmissing = pulp_embed_missing_asset_count(v);
+            for (int i = 0; i < nmissing; ++i) {
+                char path[1024] = {0};
+                pulp_embed_missing_asset(v, i, path, sizeof path);
+                info(std::string("  MISSING render asset: ") + path);
             }
-            auto path_for = [&](const std::string& id) -> std::string {
-                for (const auto& m : manifest) if (m.first == id) return m.second;
-                return {};
-            };
-            auto check_path = [&](const std::string& lp, const std::string& why) {
-                if (lp.empty()) return;
-                ++checked;
-                const std::string full = (lp[0] == '/') ? lp : base + "/" + lp;
-                if (!file_exists(full)) { ++missing; info("  MISSING " + why + ": " + lp); }
-            };
-
-            // Render-referenced: faithful frame SVGs + font assets.
-            std::set<std::string> referenced;
-            for (const auto& id : scan_string_field(blob, "svg_asset_id")) referenced.insert(id);
-            // font_refs[].asset_id -> the .ttf/.otf the text shaper loads.
-            for (const auto& id : referenced) check_path(path_for(id), "render asset");
-
-            // Unreferenced manifest rasters: warn (fallback assets the faithful
-            // render does not load), do not fail.
-            int unref_missing = 0;
-            for (const auto& m : manifest) {
-                if (referenced.count(m.first)) continue;
-                const std::string full = (m.second[0] == '/') ? m.second : base + "/" + m.second;
-                if (!file_exists(full)) ++unref_missing;
-            }
-            if (unref_missing > 0)
-                info("note: " + std::to_string(unref_missing) +
-                     " unreferenced fallback asset(s) absent (not loaded by this render)");
-            info("render assets referenced: " + std::to_string(checked) +
-                 ", missing: " + std::to_string(missing));
+            missing = nmissing;
+            info("render assets missing: " + std::to_string(missing) +
+                 " (faithful-frame svg refs, via embed ABI)");
             check(missing == 0, "every render-referenced asset resolves on disk (no placeholder)");
         } else {
             const std::string ui = read_file(src + "/ui.js");

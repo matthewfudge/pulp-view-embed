@@ -66,6 +66,34 @@ if(PULP_VIEW_EMBED_SHARED AND APPLE)
         # Find the bundled libwgpu_native.dylib next to us at runtime.
         BUILD_WITH_INSTALL_RPATH OFF
         INSTALL_RPATH "@loader_path")
+elseif(PULP_VIEW_EMBED_SHARED AND UNIX AND NOT ANDROID)
+    # Linux analog of the macOS .exp: a version script that exports only the
+    # pulp_embed_* C ABI and makes everything else (incl. symbols pulled from the
+    # static Pulp/Skia/Abseil/WebP archives) local. This is the load-bearing part
+    # and mirrors the macOS allowlist exactly — the .exp is the sole exported-
+    # symbol gate there, with no -fvisibility=hidden, and the same holds here.
+    # (NB: -fvisibility=hidden on the embed TU would HIDE the pulp_embed_* defs
+    # before the script's `global:` could export them — they carry no default-
+    # visibility attribute — yielding an empty export table. Don't add it without
+    # also annotating every public function PULP_EMBED_API; the version script
+    # alone already localizes the archive symbols, so it's unnecessary.)
+    # $ORIGIN rpath mirrors @loader_path so a relocatable tarball finds its deps.
+    set(_embed_map "${CMAKE_CURRENT_SOURCE_DIR}/src/pulp_view_embed.map")
+    target_link_options(pulp_view_embed PRIVATE
+        "-Wl,--version-script=${_embed_map}")
+    set_property(TARGET pulp_view_embed APPEND
+        PROPERTY LINK_DEPENDS "${_embed_map}")
+    set_target_properties(pulp_view_embed PROPERTIES
+        BUILD_WITH_INSTALL_RPATH OFF
+        INSTALL_RPATH "$ORIGIN")
+    # Make the .so self-contained: GNU ld's single pass needs -lfontconfig AFTER
+    # libskia.a, else dlopen fails on undefined FcDefaultSubstitute. The helper
+    # was already applied to the embed executables; the shared lib needs it too so
+    # a host can dlopen it without separately pulling fontconfig (mirrors the
+    # macOS dylib bundling its deps).
+    if(COMMAND pulp_link_fontconfig_after_skia)
+        pulp_link_fontconfig_after_skia(pulp_view_embed)
+    endif()
 endif()
 
 # ── Install / export (find_package(pulp_view_embed CONFIG)) ──────────────────
@@ -79,6 +107,7 @@ if(PULP_VIEW_EMBED_SHARED)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     install(FILES include/pulp_view_embed.h
+                  include/pulp_view_embed.hpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
     # Bundle the one non-system runtime dependency (the WebGPU backend dylib)
@@ -168,10 +197,38 @@ target_link_libraries(pulp-embed-validate PRIVATE pulp_view_embed)
 if(APPLE)
     target_link_libraries(pulp-embed-validate PRIVATE "-framework AppKit")
 endif()
+# Linux: re-mention fontconfig AFTER libskia.a on the link line (single-pass GNU
+# ld; the Skia archive references Fc* symbols). The helper ships with the SDK and
+# is exposed by PulpConfig.cmake; COMMAND-guarded for older SDKs that predate it.
+if(UNIX AND NOT APPLE AND NOT ANDROID AND COMMAND pulp_link_fontconfig_after_skia)
+    pulp_link_fontconfig_after_skia(pulp-embed-validate)
+endif()
 # Self-test: the faithful "VST Style" fixture must pass the preflight clean.
 add_test(NAME embed-validate-faithful
     COMMAND pulp-embed-validate
         "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/figma-vst-style-faithful/design.ir.json"
         --design-w 1000 --design-h 600)
+
+# Linux: live X11 host smoke — attach Pulp's child into a real X11 parent window
+# and capture the live back buffer (proves the X11PluginViewHost attach path, not
+# just the headless render). Needs an X server at runtime (run via xvfb-run); the
+# ctest wraps it in xvfb-run when found, else marks the test skipped.
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    find_package(X11)
+    if(X11_FOUND)
+        add_executable(pulp-embed-linux-x11-smoke examples/linux-x11-smoke/smoke.cpp)
+        target_link_libraries(pulp-embed-linux-x11-smoke PRIVATE pulp_view_embed X11::X11)
+        if(COMMAND pulp_link_fontconfig_after_skia)
+            pulp_link_fontconfig_after_skia(pulp-embed-linux-x11-smoke)
+        endif()
+        find_program(XVFB_RUN xvfb-run)
+        if(XVFB_RUN)
+            add_test(NAME embed-x11-smoke COMMAND ${XVFB_RUN} -a
+                $<TARGET_FILE:pulp-embed-linux-x11-smoke>
+                "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/figma-vst-style-faithful/design.ir.json"
+                1000 600)
+        endif()
+    endif()
+endif()
 
 endif()  # top-level only (CMAKE_SOURCE_DIR == CMAKE_CURRENT_SOURCE_DIR)

@@ -56,7 +56,24 @@ extern "C" {
  *       frame). These are new functions, not desc-layout changes.
  * The desc layout grows (host block gains resolve_resource), so this is a real
  * abi_version bump; v1/v2 callers remain accepted via struct_size gating. */
-#define PULP_VIEW_EMBED_ABI_VERSION 5u
+#define PULP_VIEW_EMBED_ABI_VERSION 7u
+
+/* v7 (2026-06): missing-asset diagnostics. Adds pulp_embed_missing_asset_count()
+ * + pulp_embed_missing_asset() so a host preflight can ask the materialized view
+ * which faithful-vector frame assets failed to resolve on disk, instead of
+ * re-parsing the DesignIR JSON + asset manifest by hand. The shim already walks
+ * the manifest at create; this just exposes the result. NO desc-layout change and
+ * NO new host callbacks — these are pure additive query functions, so v6 callers
+ * keep working unchanged (the version bump is informational/monotonic). */
+
+/* v6 (2026-06): text-field string bridge. A design's text_field controls are NOT
+ * normalized params, so they ride a separate STRING side-channel: two callbacks
+ * APPENDED to the host block (set_string UI->host, get_string host->view initial
+ * pull) plus pulp_embed_string_param_count/_key/_get + pulp_embed_set_string.
+ * Strings are app-host/plugin STATE (preset name, label) — saved with the
+ * plugin, NOT a DAW-automatable parameter (VST3/AU/CLAP have no string param).
+ * The host-block growth is struct_size-gated (v1..v5 callers' smaller desc stops
+ * before the new fields = NULL); the rest are new functions. */
 
 /* v5 (2026-06): richer parameter metadata. Adds PulpEmbedParamInfo +
  * pulp_embed_param_info() so a host can build a correct param from the design
@@ -149,6 +166,21 @@ typedef const uint8_t* (*PulpEmbedResolveResourceFn)(void* host_ctx,
                                                      const char* id,
                                                      size_t* out_len);
 
+/* Text-field string bridge (ABI v6).
+ *
+ * A design's text_field controls carry a STRING, not a normalized value, so they
+ * are bridged separately from the numeric param bridge. set_string: the user
+ * edited a text field -> the host stores the UTF-8 string (its own state; saved
+ * with the plugin, NOT automatable). get_string: pulled once after creation to
+ * seed the field from host state (preset recall) — write up to `cap` bytes
+ * (incl. NUL) into `out`, return the full length excluding NUL, or a negative to
+ * leave the field's imported placeholder/value. Both keyed by the text_field's
+ * design key (source node id); both run on the host UI thread; NULL slot = no
+ * string bridge. */
+typedef void    (*PulpEmbedSetStringFn)(void* host_ctx, const char* key, const char* utf8);
+typedef int32_t (*PulpEmbedGetStringFn)(void* host_ctx, const char* key,
+                                        char* out, int32_t cap);
+
 typedef struct PulpEmbedHostCallbacks {
     PulpEmbedSetParamFn   set_param;     /* UI gesture -> host param write      */
     PulpEmbedGetParamFn   get_param;     /* host -> view initial-value pull     */
@@ -158,6 +190,9 @@ typedef struct PulpEmbedHostCallbacks {
     /* ABI v3 tail — struct_size-gated. A v1/v2 caller's smaller desc stops
      * before this; the shim reads it as NULL = "no resource bridge". */
     PulpEmbedResolveResourceFn resolve_resource; /* host asset bytes by id      */
+    /* ABI v6 tail — struct_size-gated (v1..v5 callers stop before this). */
+    PulpEmbedSetStringFn set_string; /* UI text edit -> host string state       */
+    PulpEmbedGetStringFn get_string; /* host -> view initial text (preset recall)*/
 } PulpEmbedHostCallbacks;
 
 /* Creation descriptor. Zero-initialize, then set struct_size = sizeof(*desc),
@@ -461,6 +496,70 @@ PulpEmbedResult pulp_embed_param_changed(PulpEmbedView* view, const char* key, d
  * server; a real embedded UI is driven by the host's own mouse/touch events. */
 PulpEmbedResult pulp_embed_simulate_param_drag(PulpEmbedView* view, int32_t index, double target_normalized);
 
+/* Host -> view: tell the embed where the mouse pointer is, in ROOT-view
+ * coordinates (top-left origin, logical pixels matching the bounds passed
+ * to pulp_embed_resize). Triggers the same hover hit-test that drives CSS
+ * :hover / `onMouseEnter` / `onMouseLeave` in non-embed Pulp windows. Host
+ * adapters (pulp-embed-juce, future iPlug2/SDL wrappers) override their
+ * platform mouseMove and forward each move here.
+ *
+ * Without this, `registerHover(id)` correctly arms the lambdas but no code
+ * path ever calls `View::set_hovered(true)` in the embedded context, so the
+ * JS `onMouseEnter` handler never fires. Symmetric counterpart to the
+ * existing pulp_embed_simulate_* family but driven by the live host pointer,
+ * not a test harness.
+ *
+ * Returns PULP_EMBED_OK on dispatch, PULP_EMBED_ERR_INVALID_ARG for a NULL
+ * view. Coordinates outside the root bounds clear hover (matches Pulp's
+ * own platform behaviour when the pointer leaves the window). */
+PulpEmbedResult pulp_embed_dispatch_mouse_move(PulpEmbedView* view, double x, double y);
+
+/* Host -> view: tell the embed the mouse pointer left the view entirely.
+ * Equivalent to dispatching a mouse-move outside the root bounds — clears
+ * any active hover state so `onMouseLeave` fires on the previously-hovered
+ * widget. Host adapters call this from their platform mouseExit / when the
+ * window loses focus. */
+PulpEmbedResult pulp_embed_dispatch_mouse_exit(PulpEmbedView* view);
+
+/* ---- text-field string bridge (ABI v6) ------------------------------- *
+ *
+ * Separate from the numeric param bridge: a design's text_field controls carry a
+ * UTF-8 string (preset name, label, search text) bound to the HOST's own state —
+ * saved/restored with the plugin, NOT a DAW-automatable parameter. Enumerated
+ * like params: one entry per bindable text_field, keyed by its design key.
+ *
+ * Direction UI -> host (user types): the shim fires host.set_string(key, utf8).
+ * Direction host -> view (preset recall): pulp_embed_set_string(view,key,utf8)
+ * writes the field's text without echoing back through set_string (no loop). The
+ * initial value is pulled once at create via host.get_string. */
+
+/* Number of bindable text_field string controls discovered in the design. */
+int32_t pulp_embed_string_param_count(PulpEmbedView* view);
+
+/* Copy the string control's design key at `index` into buf (NUL-terminated,
+ * truncated to cap). Returns the full key length excluding the NUL, or 0 for an
+ * out-of-range index / NULL view. */
+size_t pulp_embed_string_param_key(PulpEmbedView* view, int32_t index, char* buf, size_t cap);
+
+/* Copy the current UTF-8 text of the string control identified by `key` into buf
+ * (NUL-terminated, truncated to cap). Returns the full length excluding the NUL,
+ * or 0 for an unknown key / NULL view. */
+size_t pulp_embed_get_string(PulpEmbedView* view, const char* key, char* buf, size_t cap);
+
+/* Host -> view: set the text of the string control identified by `key` (preset
+ * recall / host state restore). Updates the field without re-entering
+ * host.set_string. Returns PULP_EMBED_ERR_INVALID_ARG for a NULL view/key, and
+ * PULP_EMBED_OK even if `key` matches no text_field (no-op), so a host can
+ * blind-push. */
+PulpEmbedResult pulp_embed_set_string(PulpEmbedView* view, const char* key, const char* utf8);
+
+/* Headless input primitive (tests / automation): set the text_field at `index`
+ * to `utf8` through its REAL edit path — fires host.set_string exactly as a user
+ * typing would (unlike pulp_embed_set_string, which is the host->view push and
+ * does NOT call back to the host). Returns PULP_EMBED_ERR_INVALID_ARG for a NULL
+ * view or out-of-range index. */
+PulpEmbedResult pulp_embed_simulate_text_input(PulpEmbedView* view, int32_t index, const char* utf8);
+
 /* ---- capture (tests / thumbnails) ------------------------------------ */
 
 /* Copy the current back buffer as PNG bytes into `out` (capacity `cap`).
@@ -482,6 +581,22 @@ PulpEmbedResult pulp_embed_render_png(PulpEmbedView* view, int32_t width,
                                       uint8_t* out, size_t cap, size_t* out_len);
 
 /* ---- diagnostics ------------------------------------------------------ */
+
+/* Missing-asset query (ABI v7). At create time the shim walks the DesignIR asset
+ * manifest for the faithful-vector lane and records every frame asset (svg) whose
+ * resolved local_path is absent on disk. A host preflight uses this to fail fast
+ * with the offending paths, instead of re-parsing the JSON + manifest itself.
+ * Only the faithful frame svg refs are flagged; non-faithful fallback rasters the
+ * render never loads are intentionally NOT reported (no false positives). Bundle
+ * (scripted) views resolve assets through the session, so this is always 0 there. */
+
+/* Number of missing render assets recorded for this view (0 if none / NULL). */
+int32_t pulp_embed_missing_asset_count(PulpEmbedView* view);
+
+/* Copy the missing asset path at `index` into buf (NUL-terminated, truncated to
+ * cap). Returns the full length excluding the NUL, or 0 for an out-of-range
+ * index / NULL view. */
+size_t pulp_embed_missing_asset(PulpEmbedView* view, int32_t index, char* buf, size_t cap);
 
 /* Copy the handle's last error message into buf (NUL-terminated, truncated to
  * cap). Returns the full length excluding the NUL. view may be NULL (returns 0). */
